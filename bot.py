@@ -2,7 +2,6 @@ import discord
 import os
 import re
 import asyncio
-import hashlib
 from discord.ext import commands
 from datetime import datetime
 from collections import defaultdict
@@ -29,6 +28,8 @@ LANG_MAP = {
     '.hs': 'haskell', '.ml': 'ocaml', '.zig': 'zig',
     '.nim': 'nim', '.v': 'v', '.d': 'd', '.sol': 'solidity'
 }
+
+REVERSE_LANG_MAP = {v: k for k, v in LANG_MAP.items()}
 
 SECURITY_PATTERNS = {
     'integrity_check': [
@@ -116,14 +117,29 @@ SECURITY_PATTERNS = {
     ]
 }
 
+CATEGORY_LABELS = {
+    'integrity_check': 'INTEGRITY / HASH CHECKS',
+    'memory_guard': 'MEMORY PROTECTION',
+    'speed_validation': 'SPEED / MOVEMENT VALIDATION',
+    'injection_detection': 'INJECTION / HOOK DETECTION',
+    'anti_debug': 'ANTI-DEBUG',
+    'anti_tamper': 'ANTI-TAMPER / OBFUSCATION',
+    'network_validation': 'NETWORK / SERVER AUTHORITY',
+    'input_validation': 'INPUT VALIDATION / RATE LIMITS',
+    'encryption': 'ENCRYPTION / CRYPTOGRAPHY',
+    'obfuscation': 'OBFUSCATION TECHNIQUES',
+    'resource_protection': 'RESOURCE PROTECTION',
+    'behavior_analysis': 'BEHAVIOR ANALYSIS'
+}
+
 def build_embed(phase, filename, lang, progress_pct, fields=None, color=0x2F3136):
     embed = discord.Embed(
         title="Reverse Engineering Pipeline",
-        description=f"Target: {filename}\nLanguage: {lang.upper()}",
+        description="Target: " + filename + "\nLanguage: " + lang.upper(),
         color=color,
         timestamp=datetime.utcnow()
     )
-    embed.set_footer(text=f"Phase {phase}/3 - {progress_pct}% complete")
+    embed.set_footer(text="Phase " + str(phase) + "/3 - " + str(progress_pct) + "% complete")
 
     status = ["[ ]", "[ ]", "[ ]"]
     labels = [
@@ -138,7 +154,7 @@ def build_embed(phase, filename, lang, progress_pct, fields=None, color=0x2F3136
 
     for i in range(3):
         embed.add_field(
-            name=f"Task {i+1} {status[i]}",
+            name="Task " + str(i+1) + " " + status[i],
             value=labels[i],
             inline=False
         )
@@ -155,13 +171,8 @@ def deep_analyze(content, ext):
         'functions': [],
         'classes': [],
         'security': {},
-        'entry_points': [],
         'imports': [],
-        'constants': [],
         'globals': [],
-        'control_flow': [],
-        'data_flow': [],
-        'dependencies': defaultdict(list),
         'total_lines': len(content.splitlines()),
         'total_chars': len(content),
         'complexity_score': 0,
@@ -193,7 +204,7 @@ def deep_analyze(content, ext):
             tree = parser.parse(bytes(content, "utf8"))
             root = tree.root_node
 
-            def walk(node, depth=0, parent=None):
+            def walk(node, depth=0):
                 if depth > results['nesting_depth']:
                     results['nesting_depth'] = depth
                 
@@ -209,8 +220,7 @@ def deep_analyze(content, ext):
                             'size': node.end_point[0] - node.start_point[0],
                             'params': [],
                             'calls': [],
-                            'complexity': 0,
-                            'returns': []
+                            'complexity': 0
                         }
                         
                         for child in node.children:
@@ -231,10 +241,6 @@ def deep_analyze(content, ext):
                                                'case_statement']:
                                 func_info['complexity'] += 1
                                 results['cyclomatic_complexity'] += 1
-                            elif child.type in ['return_statement']:
-                                func_info['returns'].append(
-                                    child.text.decode('utf8', errors='ignore')[:50]
-                                )
                         
                         results['functions'].append(func_info)
                         results['complexity_score'] += func_info['complexity']
@@ -246,9 +252,7 @@ def deep_analyze(content, ext):
                     if name_node:
                         results['classes'].append({
                             'name': name_node.text.decode('utf8', errors='ignore'),
-                            'line': node.start_point[0] + 1,
-                            'methods': [],
-                            'fields': []
+                            'line': node.start_point[0] + 1
                         })
                         
                 elif node.type in ['import_statement', 'import_from_statement',
@@ -265,7 +269,7 @@ def deep_analyze(content, ext):
                         )
                 
                 for child in node.children:
-                    walk(child, depth + 1, node.type)
+                    walk(child, depth + 1)
 
             walk(root)
         except Exception:
@@ -286,8 +290,7 @@ def deep_analyze(content, ext):
                     'size': 0,
                     'params': [],
                     'calls': [],
-                    'complexity': 0,
-                    'returns': []
+                    'complexity': 0
                 })
 
     if not results['imports']:
@@ -301,15 +304,15 @@ def generate_comprehensive_report(results, ext, filename):
     lines.append("=" * 70)
     lines.append("COMPREHENSIVE STRUCTURAL ANALYSIS REPORT")
     lines.append("=" * 70)
-    lines.append(f"Target File: {filename}")
-    lines.append(f"Language: {LANG_MAP.get(ext, ext).upper()}")
-    lines.append(f"Generated: {datetime.utcnow().isoformat()}")
-    lines.append(f"Lines Analyzed: {results['total_lines']}")
-    lines.append(f"Characters Analyzed: {results['total_chars']}")
-    lines.append(f"Complexity Score: {results['complexity_score']}")
-    lines.append(f"Cyclomatic Complexity: {results['cyclomatic_complexity']}")
-    lines.append(f"Max Nesting Depth: {results['nesting_depth']}")
-    lines.append(f"Security Score: {results['security_score']}")
+    lines.append("Target File: " + filename)
+    lines.append("Language: " + LANG_MAP.get(ext, ext).upper())
+    lines.append("Generated: " + datetime.utcnow().isoformat())
+    lines.append("Lines Analyzed: " + str(results['total_lines']))
+    lines.append("Characters Analyzed: " + str(results['total_chars']))
+    lines.append("Complexity Score: " + str(results['complexity_score']))
+    lines.append("Cyclomatic Complexity: " + str(results['cyclomatic_complexity']))
+    lines.append("Max Nesting Depth: " + str(results['nesting_depth']))
+    lines.append("Security Score: " + str(results['security_score']))
     lines.append("=" * 70)
     lines.append("")
 
@@ -317,30 +320,16 @@ def generate_comprehensive_report(results, ext, filename):
     if sec:
         lines.append("SECURITY MECHANISMS IDENTIFIED")
         lines.append("-" * 70)
-        lines.append(f"Total Vectors: {sum(len(v) for v in sec.values())}")
+        total_vectors = sum(len(v) for v in sec.values())
+        lines.append("Total Vectors: " + str(total_vectors))
         lines.append("")
 
-        category_labels = {
-            'integrity_check': 'INTEGRITY / HASH CHECKS',
-            'memory_guard': 'MEMORY PROTECTION',
-            'speed_validation': 'SPEED / MOVEMENT VALIDATION',
-            'injection_detection': 'INJECTION / HOOK DETECTION',
-            'anti_debug': 'ANTI-DEBUG',
-            'anti_tamper': 'ANTI-TAMPER / OBFUSCATION',
-            'network_validation': 'NETWORK / SERVER AUTHORITY',
-            'input_validation': 'INPUT VALIDATION / RATE LIMITS',
-            'encryption': 'ENCRYPTION / CRYPTOGRAPHY',
-            'obfuscation': 'OBFUSCATION TECHNIQUES',
-            'resource_protection': 'RESOURCE PROTECTION',
-            'behavior_analysis': 'BEHAVIOR ANALYSIS'
-        }
-
         for cat, matches in sec.items():
-            label = category_labels.get(cat, cat.upper())
-            lines.append(f"[{label}]")
-            lines.append(f"  Detection Surface: {len(matches)} vectors")
+            label = CATEGORY_LABELS.get(cat, cat.upper())
+            lines.append("[" + label + "]")
+            lines.append("  Detection Surface: " + str(len(matches)) + " vectors")
             for m in matches:
-                lines.append(f"    - {m}")
+                lines.append("    - " + str(m))
             lines.append("")
     else:
         lines.append("No security mechanisms detected in surface scan.")
@@ -350,7 +339,7 @@ def generate_comprehensive_report(results, ext, filename):
     if results['functions']:
         lines.append("FUNCTION ANALYSIS")
         lines.append("-" * 70)
-        lines.append(f"Total Functions: {len(results['functions'])}")
+        lines.append("Total Functions: " + str(len(results['functions'])))
         lines.append("")
         
         security_relevant = []
@@ -367,44 +356,50 @@ def generate_comprehensive_report(results, ext, filename):
         if security_relevant:
             lines.append("Security-Relevant Functions:")
             for fn, cats in security_relevant:
-                line_info = f" (line {fn['line']})" if fn['line'] else ""
-                lines.append(f"  - {fn['name']}{line_info}")
-                lines.append(f"    Related to: {', '.join(set(cats))}")
+                line_info = ""
+                if fn['line']:
+                    line_info = " (line " + str(fn['line']) + ")"
+                lines.append("  - " + fn['name'] + line_info)
+                lines.append("    Related to: " + ", ".join(set(cats)))
                 if fn['params']:
-                    lines.append(f"    Parameters: {', '.join(fn['params'][:5])}")
+                    lines.append("    Parameters: " + ", ".join(fn['params'][:5]))
                 if fn['calls']:
-                    lines.append(f"    Calls: {', '.join(fn['calls'][:5])}")
-                lines.append(f"    Complexity: {fn['complexity']}")
+                    lines.append("    Calls: " + ", ".join(fn['calls'][:5]))
+                lines.append("    Complexity: " + str(fn['complexity']))
                 lines.append("")
         
         lines.append("All Functions:")
         for fn in results['functions'][:40]:
-            line_info = f" (line {fn['line']}, {fn['size']} lines)" if fn['line'] else ""
-            lines.append(f"  - {fn['name']}{line_info}")
+            line_info = ""
+            if fn['line']:
+                line_info = " (line " + str(fn['line']) + ", " + str(fn['size']) + " lines)"
+            lines.append("  - " + fn['name'] + line_info)
         if len(results['functions']) > 40:
-            lines.append(f"  ... and {len(results['functions']) - 40} more")
+            lines.append("  ... and " + str(len(results['functions']) - 40) + " more")
         lines.append("")
 
     if results['classes']:
         lines.append("CLASS / STRUCT ANALYSIS")
         lines.append("-" * 70)
-        lines.append(f"Total Classes/Structs: {len(results['classes'])}")
+        lines.append("Total Classes/Structs: " + str(len(results['classes'])))
         for cls in results['classes'][:25]:
-            line_info = f" (line {cls['line']})" if isinstance(cls, dict) and cls.get('line') else ""
+            line_info = ""
+            if isinstance(cls, dict) and cls.get('line'):
+                line_info = " (line " + str(cls['line']) + ")"
             name = cls['name'] if isinstance(cls, dict) else cls
-            lines.append(f"  - {name}{line_info}")
+            lines.append("  - " + name + line_info)
         if len(results['classes']) > 25:
-            lines.append(f"  ... and {len(results['classes']) - 25} more")
+            lines.append("  ... and " + str(len(results['classes']) - 25) + " more")
         lines.append("")
 
     if results['imports']:
         lines.append("DEPENDENCIES / IMPORTS")
         lines.append("-" * 70)
-        lines.append(f"Total Imports: {len(results['imports'])}")
+        lines.append("Total Imports: " + str(len(results['imports'])))
         for imp in results['imports'][:20]:
-            lines.append(f"  - {imp}")
+            lines.append("  - " + imp)
         if len(results['imports']) > 20:
-            lines.append(f"  ... and {len(results['imports']) - 20} more")
+            lines.append("  ... and " + str(len(results['imports']) - 20) + " more")
         lines.append("")
 
     if results['globals']:
@@ -412,14 +407,14 @@ def generate_comprehensive_report(results, ext, filename):
         lines.append("-" * 70)
         unique_globals = list(set(results['globals']))[:30]
         for g in unique_globals:
-            lines.append(f"  - {g}")
+            lines.append("  - " + g)
         lines.append("")
 
     if results['string_literals']:
         lines.append("STRING LITERALS (SAMPLE)")
         lines.append("-" * 70)
         for s in results['string_literals'][:15]:
-            lines.append(f"  - \"{s}\"")
+            lines.append("  - \"" + s + "\"")
         lines.append("")
 
     if results['numeric_constants']:
@@ -427,7 +422,7 @@ def generate_comprehensive_report(results, ext, filename):
         lines.append("-" * 70)
         unique_nums = list(set(results['numeric_constants']))[:20]
         for n in unique_nums:
-            lines.append(f"  - {n}")
+            lines.append("  - " + n)
         lines.append("")
 
     if results['function_calls']:
@@ -438,7 +433,7 @@ def generate_comprehensive_report(results, ext, filename):
             call_counts[call] += 1
         sorted_calls = sorted(call_counts.items(), key=lambda x: x[1], reverse=True)[:20]
         for call, count in sorted_calls:
-            lines.append(f"  - {call}: {count} calls")
+            lines.append("  - " + call + ": " + str(count) + " calls")
         lines.append("")
 
     lines.append("=" * 70)
@@ -528,10 +523,10 @@ async def reverse_engineer(ctx):
     lang = LANG_MAP.get(ext, 'unknown')
 
     if lang == 'unknown':
-        await ctx.send(f"Extension `{ext}` is not in the supported language map.")
+        await ctx.send("Extension `" + ext + "` is not in the supported language map.")
         return
 
-    file_path = f"temp_{filename}"
+    file_path = "temp_" + filename
     await attachment.save(file_path)
 
     msg = await ctx.send(embed=build_embed(0, filename, lang, 0, color=0xF1C40F))
@@ -548,28 +543,39 @@ async def reverse_engineer(ctx):
 
     sec_count = sum(len(v) for v in results['security'].values())
     phase2_fields = [
-        ("Functions Found", f"`{len(results['functions'])}`"),
-        ("Classes / Structs", f"`{len(results['classes'])}`"),
-        ("Security Vectors", f"`{sec_count}`"),
-        ("Imports", f"`{len(results['imports'])}`"),
-        ("Complexity Score", f"`{results['complexity_score']}`"),
-        ("Cyclomatic Complexity", f"`{results['cyclomatic_complexity']}`"),
-        ("Security Score", f"`{results['security_score']}`")
+        ("Functions Found", "`" + str(len(results['functions'])) + "`"),
+        ("Classes / Structs", "`" + str(len(results['classes'])) + "`"),
+        ("Security Vectors", "`" + str(sec_count) + "`"),
+        ("Imports", "`" + str(len(results['imports'])) + "`"),
+        ("Complexity Score", "`" + str(results['complexity_score']) + "`"),
+        ("Cyclomatic Complexity", "`" + str(results['cyclomatic_complexity']) + "`"),
+        ("Security Score", "`" + str(results['security_score']) + "`")
     ]
     await msg.edit(embed=build_embed(2, filename, lang, 66, fields=phase2_fields, color=0xE67E22))
 
     await asyncio.sleep(2)
 
     report_content = generate_comprehensive_report(results, ext, filename)
-    out_path = f"comprehensive_analysis_{filename}.txt"
+    out_path = "comprehensive_analysis_" + filename + ".txt"
     with open(out_path, 'w') as f:
         f.write(report_content)
 
     sec_categories = list(results['security'].keys())
+    sec_relevant_count = 0
+    for fn in results['functions']:
+        for cat_matches in results['security'].values():
+            for m in cat_matches:
+                if m.lower() in fn['name'].lower():
+                    sec_relevant_count += 1
+                    break
+            else:
+                continue
+            break
+
     phase3_fields = [
-        ("Mechanisms Identified", f"`{len(sec_categories)}`"),
-        ("Security-Relevant Functions", f"`{sum(1 for fn in results['functions'] if any(m.lower() in fn['name'].lower() for cat in results['security'].values() for m in cat))}`"),
-        ("Output File", f"`{out_path}`"),
+        ("Mechanisms Identified", "`" + str(len(sec_categories)) + "`"),
+        ("Security-Relevant Functions", "`" + str(sec_relevant_count) + "`"),
+        ("Output File", "`" + out_path + "`"),
         ("Status", "`COMPLETE`")
     ]
     await msg.edit(embed=build_embed(3, filename, lang, 100, fields=phase3_fields, color=0x2ECC71))
@@ -591,7 +597,7 @@ async def generate_bypass(ctx):
         await ctx.send("The file must be a .txt analysis report.")
         return
 
-    file_path = f"temp_{filename}"
+    file_path = "temp_" + filename
     await attachment.save(file_path)
 
     with open(file_path, 'r', errors='ignore') as f:
@@ -601,13 +607,11 @@ async def generate_bypass(ctx):
     ext = '.lua'
     if lang_match:
         lang = lang_match.group(1).lower()
-        for e, l in LANG_MAP.items():
-            if l == lang:
-                ext = e
-                break
+        if lang in REVERSE_LANG_MAP:
+            ext = REVERSE_LANG_MAP[lang]
 
     bypass_content = generate_bypass_template(content, ext)
-    out_path = f"bypass_template_{filename.replace('.txt', ext)}"
+    out_path = "bypass_template_" + filename.replace('.txt', ext)
     
     with open(out_path, 'w') as f:
         f.write(bypass_content)
