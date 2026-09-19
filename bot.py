@@ -620,4 +620,5 @@ async def generate_bypass(ctx):
     os.remove(file_path)
     os.remove(out_path)
 
+TOKEN = os.environ.get('TOKEN')
 bot.run(TOKEN)
