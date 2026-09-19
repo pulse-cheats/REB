@@ -14,6 +14,7 @@ except ImportError:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix='.', intents=intents)
 
 LANG_MAP = {
@@ -31,6 +32,12 @@ LANG_MAP = {
 
 REVERSE_LANG_MAP = {v: k for k, v in LANG_MAP.items()}
 
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    print(f"Command error in {ctx.channel}: {error}")
+
 class SourceAnalyzer:
     def __init__(self, content, ext):
         self.content = content
@@ -39,16 +46,6 @@ class SourceAnalyzer:
         self.lines = content.splitlines()
         self.total_lines = len(self.lines)
         self.total_chars = len(content)
-
-    def extract_strings(self):
-        return re.findall(r'["\']([^"\']{3,50})["\']', self.content)[:30]
-
-    def extract_constants(self):
-        return list(set(re.findall(r'\b(\d+\.?\d*)\b', self.content)))[:50]
-
-    def extract_comments(self):
-        comments = re.findall(r'(//.*|#.*|--.*|/\*.*?\*/)', self.content, re.DOTALL)
-        return [c.strip() for c in comments if len(c.strip()) > 5][:20]
 
 class ASTBuilder:
     def __init__(self, content, lang):
@@ -74,15 +71,7 @@ class SymbolExtractor:
         self.functions = []
         self.classes = []
         self.variables = []
-        self.constants = []
         self.imports = []
-        self.macros = []
-        self.decorators = []
-        self.generics = []
-        self.callbacks = []
-        self.lambdas = []
-        self.globals = []
-        self.entry_points = []
 
     def extract(self):
         if not self.root:
@@ -99,10 +88,6 @@ class SymbolExtractor:
                     'name': name_node.text.decode('utf8', errors='ignore'),
                     'line': node.start_point[0] + 1,
                     'size': node.end_point[0] - node.start_point[0],
-                    'params': [],
-                    'calls': [],
-                    'complexity': 0,
-                    'returns': [],
                     'depth': depth
                 })
         elif node_type in ['class_definition', 'class_declaration', 'struct_item', 'interface_declaration', 'impl_item', 'enum_item']:
@@ -115,16 +100,6 @@ class SymbolExtractor:
                 })
         elif node_type in ['import_statement', 'import_from_statement', 'using_directive', 'use_declaration', 'include_directive', 'require_statement']:
             self.imports.append(node.text.decode('utf8', errors='ignore')[:100])
-        elif node_type in ['assignment', 'variable_declaration', 'const_declaration', 'let_declaration']:
-            var_name = node.child_by_field_name('name') or node.child_by_field_name('left')
-            if var_name:
-                self.variables.append(var_name.text.decode('utf8', errors='ignore'))
-        elif node_type in ['decorator', 'annotation']:
-            self.decorators.append(node.text.decode('utf8', errors='ignore')[:50])
-        elif node_type in ['macro_definition', 'preproc_def']:
-            self.macros.append(node.text.decode('utf8', errors='ignore')[:50])
-        elif node_type in ['lambda', 'arrow_function', 'closure']:
-            self.lambdas.append(node.text.decode('utf8', errors='ignore')[:50])
         
         for child in node.children:
             self._walk(child, depth + 1)
@@ -137,81 +112,39 @@ class SymbolExtractor:
         ]
         for p in func_patterns:
             for f in re.findall(p, self.content):
-                self.functions.append({'name': f, 'line': 0, 'size': 0, 'params': [], 'calls': [], 'complexity': 0, 'returns': [], 'depth': 0})
+                self.functions.append({'name': f, 'line': 0, 'size': 0, 'depth': 0})
         
         imp = re.findall(r'(?:import|require|include|using|#include)\s+[<"\']([^>"\']+)[>"\']', self.content)
         self.imports = imp[:30]
 
 class ControlFlowAnalyzer:
-    def __init__(self, functions, content):
-        self.functions = functions
+    def __init__(self, content):
         self.content = content
         self.branches = 0
         self.loops = 0
         self.early_returns = 0
         self.error_paths = 0
-        self.unreachable_code = 0
-        self.recursion = []
 
     def analyze(self):
         self.branches = len(re.findall(r'\b(if|else|switch|case|match)\b', self.content, re.IGNORECASE))
         self.loops = len(re.findall(r'\b(for|while|do|loop|repeat)\b', self.content, re.IGNORECASE))
-        self.early_returns = len(re.findall(r'\breturn\b', self.content)) - len(self.functions)
+        self.early_returns = len(re.findall(r'\breturn\b', self.content))
         self.error_paths = len(re.findall(r'\b(catch|except|rescue|err|error)\b', self.content, re.IGNORECASE))
-        
-        for fn in self.functions:
-            if fn['name'] in self.content[fn['name']:]: 
-                pass 
-            call_count = self.content.count(fn['name'])
-            if call_count > 1:
-                self.recursion.append(fn['name'])
 
 class DataFlowAnalyzer:
-    def __init__(self, variables, content):
-        self.variables = variables
+    def __init__(self, content):
         self.content = content
-        self.definitions = []
-        self.uses = []
-        self.transformations = []
-        self.propagations = []
+        self.transformations = 0
 
     def analyze(self):
-        for var in self.variables[:20]:
-            defs = len(re.findall(rf'\b{re.escape(var)}\s*=', self.content))
-            uses = len(re.findall(rf'\b{re.escape(var)}\b', self.content)) - defs
-            if defs > 0:
-                self.definitions.append({'var': var, 'count': defs})
-            if uses > 0:
-                self.uses.append({'var': var, 'count': uses})
-        
         self.transformations = len(re.findall(r'[\+\-\*/%]=|<<=|>>=|&=|\|=|\^=', self.content))
 
-class CallGraphBuilder:
-    def __init__(self, functions, content):
-        self.functions = functions
-        self.content = content
-        self.graph = defaultdict(list)
-        self.callers = defaultdict(list)
-        self.callees = defaultdict(list)
-
-    def build(self):
-        func_names = [f['name'] for f in self.functions]
-        for fn in self.functions:
-            fn_text = self.content 
-            for target in func_names:
-                if target != fn['name'] and target in self.content:
-                    self.graph[fn['name']].append(target)
-                    self.callers[target].append(fn['name'])
-                    self.callees[fn['name']].append(target)
-
 class DependencyAnalyzer:
-    def __init__(self, imports, content):
+    def __init__(self, imports):
         self.imports = imports
-        self.content = content
         self.external_libs = []
-        self.internal_modules = []
         self.frameworks = []
-        self.system_libs = []
+        self.internal_modules = []
 
     def analyze(self):
         known_frameworks = ['discord', 'flask', 'django', 'react', 'vue', 'angular', 'spring', 'express', 'fastapi', 'torch', 'tensorflow']
@@ -232,35 +165,32 @@ class BehavioralClassifier:
 
     def classify(self):
         behavior_patterns = {
-            'Networking': [r'socket', r'connect', r'send', r'recv', r'request', r'fetch', r'axios', r'http'],
-            'File I/O': [r'open', r'read', r'write', r'close', r'fs\.', r'fopen', r'fprintf'],
-            'Database': [r'sql', r'query', r'execute', r'cursor', r'mongo', r'redis', r'db\.', r'database'],
+            'Networking': [r'socket', r'connect', r'send', r'recv', r'request', r'fetch', r'http'],
+            'File I/O': [r'open', r'read', r'write', r'close', r'fopen', r'fprintf'],
+            'Database': [r'sql', r'query', r'execute', r'cursor', r'mongo', r'redis', r'database'],
             'Cryptography': [r'encrypt', r'decrypt', r'hash', r'sha', r'aes', r'rsa', r'cipher', r'sign'],
-            'Authentication': [r'login', r'logout', r'auth', r'token', r'jwt', r'session', r'password', r'credential'],
-            'UI/Rendering': [r'render', r'draw', r'paint', r'ui', r'widget', r'component', r'canvas', r'gl\.', r'd3d'],
-            'Physics/Movement': [r'velocity', r'acceleration', r'force', r'mass', r'gravity', r'collision', r'physics', r'move', r'walk', r'jump'],
-            'AI/Machine Learning': [r'model', r'train', r'predict', r'neural', r'tensor', r'inference', r'learn'],
+            'Authentication': [r'login', r'logout', r'auth', r'token', r'jwt', r'session', r'password'],
+            'Physics/Movement': [r'velocity', r'acceleration', r'force', r'mass', r'gravity', r'collision', r'move', r'walk', r'jump'],
             'Security': [r'validate', r'sanitize', r'filter', r'guard', r'protect', r'check', r'verify']
         }
         
         for fn in self.functions:
             for cat, patterns in behavior_patterns.items():
                 for p in patterns:
-                    if re.search(p, fn['name'], re.IGNORECASE) or re.search(p, self.content[max(0, fn['line']-5):fn['line']+fn['size']+5] if fn['line'] else '', re.IGNORECASE):
+                    if re.search(p, fn['name'], re.IGNORECASE):
                         if fn['name'] not in self.categories[cat]:
                             self.categories[cat].append(fn['name'])
                         break
 
 class SecurityAnalyzer:
-    def __init__(self, content, functions):
+    def __init__(self, content):
         self.content = content
-        self.functions = functions
         self.findings = []
         self.weaknesses = []
 
     def analyze(self):
         security_patterns = {
-            'Input Validation': [r'sanitize', r'validate', r'filter', r'escape', r'htmlspecialchars', r'PreparedStatement'],
+            'Input Validation': [r'sanitize', r'validate', r'filter', r'escape'],
             'Authentication': [r'authenticate', r'authorize', r'login', r'jwt', r'oauth', r'session'],
             'Encryption': [r'AES', r'RSA', r'encrypt', r'decrypt', r'cipher', r'hashlib', r'bcrypt'],
             'Integrity': [r'checksum', r'hash', r'signature', r'HMAC', r'verify'],
@@ -269,7 +199,7 @@ class SecurityAnalyzer:
         }
         
         weakness_patterns = {
-            'Unsafe Input': [r'eval\(', r'exec\(', r'system\(', r'popen', r'Runtime\.getRuntime'],
+            'Unsafe Input': [r'eval\(', r'exec\(', r'system\(', r'popen'],
             'Hardcoded Secrets': [r'password\s*=\s*["\'][^"\']+["\']', r'api_key\s*=\s*["\'][^"\']+["\']', r'token\s*=\s*["\'][^"\']+["\']'],
             'Weak Crypto': [r'MD5', r'SHA1', r'DES', r'RC4', r'ECB']
         }
@@ -287,9 +217,8 @@ class SecurityAnalyzer:
                     self.weaknesses.append({'category': cat, 'evidence': list(set(matches))[:3]})
 
 class GameAnalyzer:
-    def __init__(self, content, functions):
+    def __init__(self, content):
         self.content = content
-        self.functions = functions
         self.game_features = []
 
     def analyze(self):
@@ -309,9 +238,7 @@ class GameAnalyzer:
                     break
 
 class PatternDetector:
-    def __init__(self, data_flow, control_flow, security, game):
-        self.data_flow = data_flow
-        self.control_flow = control_flow
+    def __init__(self, security, game):
         self.security = security
         self.game = game
         self.patterns = []
@@ -332,11 +259,6 @@ class PatternDetector:
             })
 
 class ConfidenceEngine:
-    def __init__(self, patterns, security, behavioral):
-        self.patterns = patterns
-        self.security = security
-        self.behavioral = behavioral
-
     def calculate(self, base_score, evidence_count, is_primary):
         score = base_score
         score += min(evidence_count * 5, 20)
@@ -351,12 +273,11 @@ class ConfidenceEngine:
         return 'UNCERTAIN'
 
 class ReportGenerator:
-    def __init__(self, source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine):
+    def __init__(self, source, symbols, control_flow, data_flow, dependencies, behavioral, security, game, patterns, confidence_engine):
         self.source = source
         self.symbols = symbols
         self.control_flow = control_flow
         self.data_flow = data_flow
-        self.call_graph = call_graph
         self.dependencies = dependencies
         self.behavioral = behavioral
         self.security = security
@@ -380,7 +301,6 @@ class ReportGenerator:
         lines.append("Functions: " + str(len(self.symbols.functions)))
         lines.append("Classes/Structs: " + str(len(self.symbols.classes)))
         lines.append("Imports: " + str(len(self.symbols.imports)))
-        lines.append("Global Variables: " + str(len(self.symbols.variables)))
         lines.append("")
 
         lines.append("2. CONTROL FLOW ANALYSIS")
@@ -389,13 +309,10 @@ class ReportGenerator:
         lines.append("Loops: " + str(self.control_flow.loops))
         lines.append("Early Returns: " + str(self.control_flow.early_returns))
         lines.append("Error Paths: " + str(self.control_flow.error_paths))
-        lines.append("Recursive Functions: " + str(len(self.control_flow.recursion)))
         lines.append("")
 
         lines.append("3. DATA FLOW ANALYSIS")
         lines.append("-" * 70)
-        lines.append("Variable Definitions: " + str(len(self.data_flow.definitions)))
-        lines.append("Variable Uses: " + str(len(self.data_flow.uses)))
         lines.append("Transformations: " + str(self.data_flow.transformations))
         lines.append("")
 
@@ -411,7 +328,7 @@ class ReportGenerator:
         for cat, funcs in self.behavioral.categories.items():
             score = self.confidence_engine.calculate(70, len(funcs), True)
             label = self.confidence_engine.get_label(score)
-            lines.append(f"[{label}] {cat}: {', '.join(funcs[:5])}")
+            lines.append("[" + label + "] " + cat + ": " + ", ".join(funcs[:5]))
         lines.append("")
 
         lines.append("6. SECURITY ANALYSIS")
@@ -419,13 +336,13 @@ class ReportGenerator:
         for finding in self.security.findings:
             score = self.confidence_engine.calculate(80, len(finding['evidence']), True)
             label = self.confidence_engine.get_label(score)
-            lines.append(f"[{label}] {finding['category']}: {', '.join(finding['evidence'])}")
+            lines.append("[" + label + "] " + finding['category'] + ": " + ", ".join(finding['evidence']))
         if self.security.weaknesses:
             lines.append("Weaknesses Detected:")
             for w in self.security.weaknesses:
                 score = self.confidence_engine.calculate(60, len(w['evidence']), False)
                 label = self.confidence_engine.get_label(score)
-                lines.append(f"  [{label}] {w['category']}: {', '.join(w['evidence'])}")
+                lines.append("  [" + label + "] " + w['category'] + ": " + ", ".join(w['evidence']))
         lines.append("")
 
         lines.append("7. GAME ANALYSIS")
@@ -442,9 +359,9 @@ class ReportGenerator:
         if self.patterns.patterns:
             for p in self.patterns.patterns:
                 label = self.confidence_engine.get_label(p['confidence'])
-                lines.append(f"Pattern: {p['name']}")
-                lines.append(f"Confidence: {label} ({p['confidence']}%)")
-                lines.append(f"Evidence: {p['evidence']}")
+                lines.append("Pattern: " + p['name'])
+                lines.append("Confidence: " + label + " (" + str(p['confidence']) + "%)")
+                lines.append("Evidence: " + p['evidence'])
                 lines.append("")
         else:
             lines.append("No complex semantic patterns detected.")
@@ -514,7 +431,7 @@ async def reverse_engineer(ctx):
 
     msg = await ctx.send(embed=build_embed(0, filename, lang, 0, color=0xF1C40F))
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
     await msg.edit(embed=build_embed(1, filename, lang, 33, color=0xF39C12))
 
     with open(file_path, 'r', errors='ignore') as f:
@@ -525,33 +442,30 @@ async def reverse_engineer(ctx):
     symbols = SymbolExtractor(ast_builder.get_root(), content)
     symbols.extract()
     
-    control_flow = ControlFlowAnalyzer(symbols.functions, content)
+    control_flow = ControlFlowAnalyzer(content)
     control_flow.analyze()
     
-    data_flow = DataFlowAnalyzer(symbols.variables, content)
+    data_flow = DataFlowAnalyzer(content)
     data_flow.analyze()
     
-    call_graph = CallGraphBuilder(symbols.functions, content)
-    call_graph.build()
-    
-    dependencies = DependencyAnalyzer(symbols.imports, content)
+    dependencies = DependencyAnalyzer(symbols.imports)
     dependencies.analyze()
     
     behavioral = BehavioralClassifier(symbols.functions, content)
     behavioral.classify()
     
-    security = SecurityAnalyzer(content, symbols.functions)
+    security = SecurityAnalyzer(content)
     security.analyze()
     
-    game = GameAnalyzer(content, symbols.functions)
+    game = GameAnalyzer(content)
     game.analyze()
     
-    patterns = PatternDetector(data_flow, control_flow, security, game)
+    patterns = PatternDetector(security, game)
     patterns.detect()
     
-    confidence_engine = ConfidenceEngine(patterns, security, behavioral)
+    confidence_engine = ConfidenceEngine()
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
 
     phase2_fields = [
         ("Functions", "`" + str(len(symbols.functions)) + "`"),
@@ -562,9 +476,9 @@ async def reverse_engineer(ctx):
     ]
     await msg.edit(embed=build_embed(2, filename, lang, 66, fields=phase2_fields, color=0xE67E22))
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
 
-    report_gen = ReportGenerator(source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine)
+    report_gen = ReportGenerator(source, symbols, control_flow, data_flow, dependencies, behavioral, security, game, patterns, confidence_engine)
     report_content = report_gen.generate()
     
     out_path = "analysis_report_" + filename + ".txt"
