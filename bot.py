@@ -4,6 +4,9 @@ import re
 import asyncio
 import traceback
 import aiohttp
+import base64
+import random
+import string
 from discord.ext import commands
 from datetime import datetime
 from collections import defaultdict
@@ -58,6 +61,176 @@ CATEGORY_LABELS = {
     'encryption': 'ENCRYPTION / CRYPTOGRAPHY',
     'obfuscation': 'OBFUSCATION TECHNIQUES'
 }
+
+class Obfuscator:
+    def __init__(self, content, lang):
+        self.content = content
+        self.lang = lang
+        self.obfuscated = content
+
+    def obfuscate_lua(self):
+        lines = self.content.split('\n')
+        obfuscated_lines = []
+        
+        var_map = {}
+        
+        def get_random_name():
+            return '_' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(4, 8)))
+        
+        for line in lines:
+            if line.strip().startswith('--') or line.strip() == '':
+                obfuscated_lines.append(line)
+                continue
+            
+            new_line = line
+            
+            func_matches = re.findall(r'function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', line)
+            for func_name in func_matches:
+                if func_name not in var_map:
+                    var_map[func_name] = get_random_name()
+                new_line = new_line.replace(func_name, var_map[func_name])
+            
+            var_matches = re.findall(r'local\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=', line)
+            for var_name in var_matches:
+                if var_name not in var_map:
+                    var_map[var_name] = get_random_name()
+                new_line = new_line.replace(var_name, var_map[var_name])
+            
+            string_matches = re.findall(r'"([^"]+)"', new_line)
+            for s in string_matches:
+                if len(s) > 3:
+                    encoded = base64.b64encode(s.encode()).decode()
+                    new_line = new_line.replace('"' + s + '"', 'string.char(' + ','.join(str(ord(c)) for c in s) + ')')
+            
+            obfuscated_lines.append(new_line)
+        
+        result = '\n'.join(obfuscated_lines)
+        
+        junk_funcs = [
+            "local function _" + ''.join(random.choices(string.ascii_lowercase, k=6)) + "(x) return x * " + str(random.randint(1, 10)) + " end",
+            "local _" + ''.join(random.choices(string.ascii_lowercase, k=6)) + " = " + str(random.randint(100, 999)),
+        ]
+        
+        for junk in junk_funcs:
+            result = result.replace('\n', '\n' + junk + '\n', 1)
+        
+        return result
+
+    def obfuscate_python(self):
+        lines = self.content.split('\n')
+        obfuscated_lines = []
+        
+        for line in lines:
+            if line.strip().startswith('#') or line.strip() == '':
+                obfuscated_lines.append(line)
+                continue
+            
+            new_line = line
+            
+            string_matches = re.findall(r"'([^']+)'", new_line)
+            for s in string_matches:
+                if len(s) > 3:
+                    encoded = base64.b64encode(s.encode()).decode()
+                    new_line = new_line.replace("'" + s + "'", "base64.b64decode('" + encoded + "').decode()")
+            
+            obfuscated_lines.append(new_line)
+        
+        import_line = "import base64\n"
+        if "import base64" not in self.content:
+            return import_line + '\n'.join(obfuscated_lines)
+        
+        return '\n'.join(obfuscated_lines)
+
+    def obfuscate_javascript(self):
+        result = self.content
+        
+        strings = re.findall(r'"([^"]+)"', result)
+        for s in strings:
+            if len(s) > 3:
+                encoded = base64.b64encode(s.encode()).decode()
+                result = result.replace('"' + s + '"', 'atob("' + encoded + '")')
+        
+        var_matches = re.findall(r'var\s+([a-zA-Z_][a-zA-Z0-9_]*)', result)
+        var_map = {}
+        for var in var_matches:
+            if var not in ['function', 'return', 'if', 'else', 'for', 'while']:
+                var_map[var] = '_' + ''.join(random.choices(string.ascii_lowercase, k=5))
+        
+        for original, obfuscated in var_map.items():
+            result = re.sub(r'\b' + original + r'\b', obfuscated, result)
+        
+        return result
+
+    def obfuscate(self):
+        if self.lang in ['lua', 'luau']:
+            return self.obfuscate_lua()
+        elif self.lang == 'python':
+            return self.obfuscate_python()
+        elif self.lang in ['javascript', 'typescript']:
+            return self.obfuscate_javascript()
+        else:
+            return self.content
+
+class Deobfuscator:
+    def __init__(self, content, lang):
+        self.content = content
+        self.lang = lang
+        self.deobfuscated = content
+
+    def deobfuscate_lua(self):
+        result = self.content
+        
+        string_char_matches = re.findall(r'string\.char\(([\d,]+)\)', result)
+        for match in string_char_matches:
+            chars = [int(c) for c in match.split(',')]
+            decoded = ''.join(chr(c) for c in chars)
+            result = result.replace('string.char(' + match + ')', '"' + decoded + '"')
+        
+        base64_matches = re.findall(r'base64\.decode\(["\']([A-Za-z0-9+/=]+)["\']\)', result)
+        for encoded in base64_matches:
+            try:
+                decoded = base64.b64decode(encoded).decode()
+                result = result.replace('base64.decode("' + encoded + '")', '"' + decoded + '"')
+            except:
+                pass
+        
+        return result
+
+    def deobfuscate_python(self):
+        result = self.content
+        
+        base64_matches = re.findall(r"base64\.b64decode\(['\"]([A-Za-z0-9+/=]+)['\"]\)\.decode\(\)", result)
+        for encoded in base64_matches:
+            try:
+                decoded = base64.b64decode(encoded).decode()
+                result = result.replace("base64.b64decode('" + encoded + "').decode()", "'" + decoded + "'")
+            except:
+                pass
+        
+        return result
+
+    def deobfuscate_javascript(self):
+        result = self.content
+        
+        atob_matches = re.findall(r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)', result)
+        for encoded in atob_matches:
+            try:
+                decoded = base64.b64decode(encoded).decode()
+                result = result.replace('atob("' + encoded + '")', '"' + decoded + '"')
+            except:
+                pass
+        
+        return result
+
+    def deobfuscate(self):
+        if self.lang in ['lua', 'luau']:
+            return self.deobfuscate_lua()
+        elif self.lang == 'python':
+            return self.deobfuscate_python()
+        elif self.lang in ['javascript', 'typescript']:
+            return self.deobfuscate_javascript()
+        else:
+            return self.content
 
 class ObfuscationDetector:
     def __init__(self, content):
@@ -951,6 +1124,59 @@ async def on_command_error(ctx, error):
 async def ping(ctx):
     await ctx.send("Pong! Bot is working.")
 
+@bot.command(name='help')
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📚 Bot Commands Help",
+        description="Complete guide to using this bot",
+        color=0x3498db,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(
+        name=".get <URL>",
+        value="Fetches a file from a URL and analyzes it for obfuscation.\n**Example:** `.get https://raw.githubusercontent.com/user/repo/file.lua`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name=".re",
+        value="Reverse engineers an attached code file. Upload a file and use this command to get a comprehensive analysis.\n**Supports:** Python, JavaScript, Lua, C++, Java, Rust, and more",
+        inline=False
+    )
+    
+    embed.add_field(
+        name=".bypass",
+        value="Generates an implementation/enforcement script based on the analysis report from `.re` command.\n**Attach the .txt analysis file**",
+        inline=False
+    )
+    
+    embed.add_field(
+        name=".obfuscate",
+        value="Creates a private channel for secure code obfuscation. Upload your file, get it obfuscated via DM, and the channel auto-deletes.\n**Perfect for Roblox/Lua scripts**",
+        inline=False
+    )
+    
+    embed.add_field(
+        name=".deobf",
+        value="Deobfuscates an obfuscated code file. Attach the obfuscated file and the bot will attempt to reverse the obfuscation.\n**Supports multiple languages**",
+        inline=False
+    )
+    
+    embed.add_field(
+        name=".ping",
+        value="Checks if the bot is online and responsive.",
+        inline=False
+    )
+    
+    embed.set_footer(text="Use these commands to analyze, obfuscate, and protect your code")
+    
+    try:
+        await ctx.author.send(embed=embed)
+        await ctx.send("✅ Help sent to your DMs!")
+    except discord.Forbidden:
+        await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.")
+
 @bot.command(name='get')
 async def fetch_file(ctx, url=None):
     if not url:
@@ -1024,6 +1250,132 @@ async def fetch_file(ctx, url=None):
         print("FETCH ERROR:", e)
         print(traceback.format_exc())
         await ctx.send("Error fetching file: " + str(e))
+
+@bot.command(name='obfuscate')
+async def obfuscate_command(ctx):
+    owner_id = ctx.guild.owner.id
+    
+    overwrites = {
+        ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        ctx.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        ctx.author: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        ctx.guild.get_member(owner_id): discord.PermissionOverwrite(read_messages=True, send_messages=True) if ctx.guild.get_member(owner_id) else discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    }
+    
+    channel_name = "obfuscate-" + ctx.author.name
+    channel = await ctx.guild.create_text_channel(channel_name, overwrites=overwrites, reason="Private obfuscation channel")
+    
+    embed = discord.Embed(
+        title="🔒 Private Obfuscation Channel",
+        description="This is a private channel for code obfuscation.\n\n**Instructions:**\n1. Upload your code file\n2. The bot will obfuscate it\n3. You'll receive the obfuscated file via DM\n4. This channel will be deleted automatically",
+        color=0x9B59B6
+    )
+    await channel.send(embed=embed)
+    await channel.send("📎 **Upload your file now!**")
+    
+    await ctx.send(f"✅ Private channel created: {channel.mention}")
+    
+    def check(m):
+        return m.channel == channel and m.author == ctx.author and len(m.attachments) > 0
+    
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=300.0)
+        
+        attachment = msg.attachments[0]
+        filename = attachment.filename
+        ext = os.path.splitext(filename)[1].lower()
+        
+        if ext not in LANG_MAP:
+            await channel.send("❌ Unsupported file type. Supported: .lua, .luau, .py, .js, .ts, .c, .cpp, .cs, .java, .rs")
+            await asyncio.sleep(3)
+            await channel.delete()
+            return
+        
+        file_data = await attachment.read()
+        content = file_data.decode('utf-8', errors='ignore')
+        
+        await channel.send("🔄 Obfuscating your code...")
+        
+        lang = LANG_MAP.get(ext, 'unknown')
+        obfuscator = Obfuscator(content, lang)
+        obfuscated_code = obfuscator.obfuscate()
+        
+        obs_filename = "obfuscated_" + filename
+        obs_path = "temp_" + obs_filename
+        
+        with open(obs_path, 'w', encoding='utf-8') as f:
+            f.write(obfuscated_code)
+        
+        try:
+            with open(obs_path, 'rb') as f:
+                await ctx.author.send("✅ **Your obfuscated file is ready!**\n\n⚠️ **Warning:** Keep this file secure. Obfuscation makes code harder to read but not impossible to reverse.", file=discord.File(f, filename=obs_filename))
+        except discord.Forbidden:
+            await channel.send("❌ I couldn't send you a DM. Please enable DMs from server members.")
+            await asyncio.sleep(3)
+            await channel.delete()
+            os.remove(obs_path)
+            return
+        
+        await channel.send("✅ Obfuscation complete! Check your DMs.\n🗑️ Deleting channel in 5 seconds...")
+        await asyncio.sleep(5)
+        
+        os.remove(obs_path)
+        await channel.delete()
+        
+    except asyncio.TimeoutError:
+        await channel.send("⏰ Timeout! No file uploaded. Deleting channel...")
+        await asyncio.sleep(3)
+        await channel.delete()
+    except Exception as e:
+        print("OBFUSCATE ERROR:", e)
+        print(traceback.format_exc())
+        await channel.send("❌ An error occurred: " + str(e))
+        await asyncio.sleep(3)
+        await channel.delete()
+
+@bot.command(name='deobf')
+async def deobfuscate_command(ctx):
+    if not ctx.message.attachments:
+        await ctx.send("❌ Please attach an obfuscated file to deobfuscate.")
+        return
+    
+    attachment = ctx.message.attachments[0]
+    filename = attachment.filename
+    ext = os.path.splitext(filename)[1].lower()
+    
+    if ext not in LANG_MAP:
+        await ctx.send(" Unsupported file type. Supported: .lua, .luau, .py, .js, .ts")
+        return
+    
+    try:
+        file_data = await attachment.read()
+        content = file_data.decode('utf-8', errors='ignore')
+        
+        await ctx.send("🔄 Analyzing and deobfuscating...")
+        
+        lang = LANG_MAP.get(ext, 'unknown')
+        deobfuscator = Deobfuscator(content, lang)
+        deobfuscated_code = deobfuscator.deobfuscate()
+        
+        deobs_filename = "deobfuscated_" + filename
+        deobs_path = "temp_" + deobs_filename
+        
+        with open(deobs_path, 'w', encoding='utf-8') as f:
+            f.write(deobfuscated_code)
+        
+        embed = discord.Embed(
+            title="✅ Deobfuscation Complete",
+            description="**Original:** " + filename + "\n**Language:** " + lang.upper() + "\n**Size:** " + str(len(deobfuscated_code)) + " bytes",
+            color=0x2ECC71
+        )
+        await ctx.send(embed=embed, file=discord.File(deobs_path, filename=deobs_filename))
+        
+        os.remove(deobs_path)
+        
+    except Exception as e:
+        print("DEOBF ERROR:", e)
+        print(traceback.format_exc())
+        await ctx.send("❌ Error deobfuscating: " + str(e))
 
 @bot.command(name='re')
 async def reverse_engineer(ctx):
