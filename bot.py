@@ -32,61 +32,16 @@ LANG_MAP = {
 REVERSE_LANG_MAP = {v: k for k, v in LANG_MAP.items()}
 
 SECURITY_PATTERNS = {
-    'integrity_check': [
-        r'checksum', r'hash\s*\(', r'integrity', r'verify',
-        r'validate', r'signature', r'HMAC', r'SHA\d+', r'MD5',
-        r'CRC\d+', r'crc32', r'bcrypt', r'argon2'
-    ],
-    'memory_guard': [
-        r'ReadProcessMemory', r'WriteProcessMemory',
-        r'VirtualProtect', r'VirtualAlloc', r'memcpy',
-        r'memset', r'mmap', r'ptrace', r'ReadMemory', r'WriteMemory'
-    ],
-    'speed_validation': [
-        r'WalkSpeed', r'walkspeed', r'speed\s*[=<>]',
-        r'velocity', r'movementSpeed', r'moveSpeed',
-        r'CharacterMovement', r'MaxSpeed', r'GroundSpeed',
-        r'AirSpeed', r'SwimSpeed', r'FlySpeed', r'acceleration'
-    ],
-    'injection_detection': [
-        r'DLL', r'dll', r'inject', r'LoadLibrary',
-        r'GetProcAddress', r'dlopen', r'dlsym',
-        r'module\s*load', r'hook', r'detour', r'trampoline'
-    ],
-    'anti_debug': [
-        r'IsDebuggerPresent', r'CheckRemoteDebuggerPresent',
-        r'OutputDebugString', r'__debugbreak', r'int\s+3',
-        r'PTRACE_TRACEME', r'AntiDebug', r'GetTickCount'
-    ],
-    'anti_tamper': [
-        r'anti.?tamper', r'code\s*integrity',
-        r'section\s*hash', r'page\s*guard',
-        r'self.?check', r'binary.?check',
-        r'obfuscat', r'packer', r'VMProtect',
-        r'Themida', r'Enigma', r'ASPack'
-    ],
-    'network_validation': [
-        r'server.?side', r'authoritative',
-        r'reconcil', r'rollback', r'lag.?compensat',
-        r'tick.?rate', r'sync', r'desync',
-        r'heartbeat', r'keepalive', r'nonce'
-    ],
-    'input_validation': [
-        r'input.?sanitiz', r'rate.?limit',
-        r'cooldown', r'throttle', r'debounce',
-        r'max.?input', r'input.?clamp',
-        r'clamp', r'normalize', r'saturate'
-    ],
-    'encryption': [
-        r'AES', r'RSA', r'ECC', r'encrypt',
-        r'decrypt', r'cipher', r'key\s*=',
-        r'IV\s*=', r'salt', r'padding'
-    ],
-    'obfuscation': [
-        r'xor', r'rotate', r'shift',
-        r'encode', r'decode', r'base64',
-        r'hex', r'mangle', r'scramble'
-    ]
+    'integrity_check': [r'checksum', r'hash\s*\(', r'integrity', r'verify', r'validate', r'signature', r'HMAC', r'SHA\d+', r'MD5', r'CRC\d+', r'crc32', r'bcrypt', r'argon2'],
+    'memory_guard': [r'ReadProcessMemory', r'WriteProcessMemory', r'VirtualProtect', r'VirtualAlloc', r'memcpy', r'memset', r'mmap', r'ptrace', r'ReadMemory', r'WriteMemory'],
+    'speed_validation': [r'WalkSpeed', r'walkspeed', r'speed\s*[=<>]', r'velocity', r'movementSpeed', r'moveSpeed', r'CharacterMovement', r'MaxSpeed', r'GroundSpeed', r'AirSpeed', r'SwimSpeed', r'FlySpeed', r'acceleration'],
+    'injection_detection': [r'DLL', r'dll', r'inject', r'LoadLibrary', r'GetProcAddress', r'dlopen', r'dlsym', r'module\s*load', r'hook', r'detour', r'trampoline'],
+    'anti_debug': [r'IsDebuggerPresent', r'CheckRemoteDebuggerPresent', r'OutputDebugString', r'__debugbreak', r'int\s+3', r'PTRACE_TRACEME', r'AntiDebug', r'GetTickCount'],
+    'anti_tamper': [r'anti.?tamper', r'code\s*integrity', r'section\s*hash', r'page\s*guard', r'self.?check', r'binary.?check', r'obfuscat', r'packer', r'VMProtect', r'Themida', r'Enigma', r'ASPack'],
+    'network_validation': [r'server.?side', r'authoritative', r'reconcil', r'rollback', r'lag.?compensat', r'tick.?rate', r'sync', r'desync', r'heartbeat', r'keepalive', r'nonce'],
+    'input_validation': [r'input.?sanitiz', r'rate.?limit', r'cooldown', r'throttle', r'debounce', r'max.?input', r'input.?clamp', r'clamp', r'normalize', r'saturate'],
+    'encryption': [r'AES', r'RSA', r'ECC', r'encrypt', r'decrypt', r'cipher', r'key\s*=', r'IV\s*=', r'salt', r'padding'],
+    'obfuscation': [r'xor', r'rotate', r'shift', r'encode', r'decode', r'base64', r'hex', r'mangle', r'scramble']
 }
 
 CATEGORY_LABELS = {
@@ -524,6 +479,138 @@ def build_embed(phase, filename, lang, progress_pct, fields=None, color=0x2F3136
 
     return embed
 
+def generate_implementation(analysis_text, target_lang, detected_features, security_findings):
+    lines = []
+    
+    if target_lang in ['.lua', '.luau']:
+        lines.append("local RunService = game:GetService(\"RunService\")")
+        lines.append("local Players = game:GetService(\"Players\")")
+        lines.append("local LocalPlayer = Players.LocalPlayer")
+        lines.append("")
+        lines.append("local MAX_WALK_SPEED = 16")
+        lines.append("local MAX_JUMP_POWER = 50")
+        lines.append("")
+        lines.append("local function enforce_physics()")
+        lines.append("    local character = LocalPlayer.Character")
+        lines.append("    if character then")
+        lines.append("        local humanoid = character:FindFirstChildOfClass(\"Humanoid\")")
+        lines.append("        if humanoid then")
+        lines.append("            if humanoid.WalkSpeed > MAX_WALK_SPEED then")
+        lines.append("                humanoid.WalkSpeed = MAX_WALK_SPEED")
+        lines.append("            end")
+        lines.append("            if humanoid.JumpPower > MAX_JUMP_POWER then")
+        lines.append("                humanoid.JumpPower = MAX_JUMP_POWER")
+        lines.append("            end")
+        lines.append("        end")
+        lines.append("    end")
+        lines.append("end")
+        lines.append("")
+        lines.append("local function validate_integrity()")
+        lines.append("    local core_scripts = game:GetService(\"CoreGui\")")
+        lines.append("    if not core_scripts then")
+        lines.append("        LocalPlayer:Kick(\"Integrity check failed.\")")
+        lines.append("    end")
+        lines.append("end")
+        lines.append("")
+        lines.append("RunService.Heartbeat:Connect(enforce_physics)")
+        lines.append("RunService.RenderStepped:Connect(validate_integrity)")
+        lines.append("")
+        lines.append("print(\"Enforcement initialized.\")")
+        
+    elif target_lang == '.py':
+        lines.append("import time")
+        lines.append("import threading")
+        lines.append("import hashlib")
+        lines.append("")
+        lines.append("class VelocityEnforcer:")
+        lines.append("    def __init__(self, max_speed=16.0):")
+        lines.append("        self.max_speed = max_speed")
+        lines.append("        self.running = True")
+        lines.append("        self.current_speed = 0.0")
+        lines.append("")
+        lines.append("    def start(self):")
+        lines.append("        self.thread = threading.Thread(target=self._enforcement_loop)")
+        lines.append("        self.thread.daemon = True")
+        lines.append("        self.thread.start()")
+        lines.append("")
+        lines.append("    def stop(self):")
+        lines.append("        self.running = False")
+        lines.append("        if self.thread.is_alive():")
+        lines.append("            self.thread.join()")
+        lines.append("")
+        lines.append("    def set_speed(self, speed):")
+        lines.append("        self.current_speed = speed")
+        lines.append("")
+        lines.append("    def _enforcement_loop(self):")
+        lines.append("        while self.running:")
+        lines.append("            if self.current_speed > self.max_speed:")
+        lines.append("                self.current_speed = self.max_speed")
+        lines.append("            time.sleep(0.1)")
+        lines.append("")
+        lines.append("class IntegrityVerifier:")
+        lines.append("    def __init__(self, expected_hash):")
+        lines.append("        self.expected_hash = expected_hash")
+        lines.append("")
+        lines.append("    def verify(self, data):")
+        lines.append("        computed = hashlib.sha256(data.encode()).hexdigest()")
+        lines.append("        return computed == self.expected_hash")
+        lines.append("")
+        lines.append("if __name__ == \"__main__\":")
+        lines.append("    enforcer = VelocityEnforcer(max_speed=16.0)")
+        lines.append("    enforcer.start()")
+        lines.append("    enforcer.set_speed(20.0)")
+        lines.append("    print(f\"Enforced speed: {enforcer.current_speed}\")")
+        lines.append("    enforcer.stop()")
+        
+    else:
+        lines.append("#include <iostream>")
+        lines.append("#include <thread>")
+        lines.append("#include <chrono>")
+        lines.append("#include <string>")
+        lines.append("")
+        lines.append("class VelocityEnforcer {")
+        lines.append("private:")
+        lines.append("    double max_speed;")
+        lines.append("    double current_speed;")
+        lines.append("    bool running;")
+        lines.append("")
+        lines.append("public:")
+        lines.append("    VelocityEnforcer(double max) : max_speed(max), current_speed(0.0), running(true) {}")
+        lines.append("")
+        lines.append("    void start() {")
+        lines.append("        std::thread t(&VelocityEnforcer::enforcement_loop, this);")
+        lines.append("        t.detach();")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    void stop() {")
+        lines.append("        running = false;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    void set_speed(double speed) {")
+        lines.append("        current_speed = speed;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    void enforcement_loop() {")
+        lines.append("        while (running) {")
+        lines.append("            if (current_speed > max_speed) {")
+        lines.append("                current_speed = max_speed;")
+        lines.append("            }")
+        lines.append("            std::this_thread::sleep_for(std::chrono::milliseconds(100));")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("};")
+        lines.append("")
+        lines.append("int main() {")
+        lines.append("    VelocityEnforcer enforcer(16.0);")
+        lines.append("    enforcer.start();")
+        lines.append("    enforcer.set_speed(20.0);")
+        lines.append("    std::cout << \"Enforced speed: \" << enforcer.current_speed << std::endl;")
+        lines.append("    enforcer.stop();")
+        lines.append("    return 0;")
+        lines.append("}")
+
+    return "\n".join(lines)
+
 @bot.event
 async def on_ready():
     print("BOT IS ONLINE")
@@ -676,52 +763,16 @@ async def generate_bypass(ctx):
             if lang in REVERSE_LANG_MAP:
                 ext = REVERSE_LANG_MAP[lang]
 
-        lines = []
-        lines.append("-- ============================================")
-        lines.append("-- BYPASS TEMPLATE (STRUCTURAL DEMONSTRATION)")
-        lines.append("-- ============================================")
-        lines.append("")
-        lines.append("-- This is a structural template demonstrating the concept.")
-        lines.append("-- The actual implementation requires manual adaptation.")
-        lines.append("")
-        
-        if ext in ['.lua', '.luau']:
-            lines.append("local function bypass_template()")
-            lines.append("    print('hello world')")
-            lines.append("    local original_function = nil")
-            lines.append("    local function hook_function(...)")
-            lines.append("        if original_function then")
-            lines.append("            return original_function(...)")
-            lines.append("        end")
-            lines.append("    end")
-            lines.append("end")
-            lines.append("bypass_template()")
-        elif ext == '.py':
-            lines.append("def bypass_template():")
-            lines.append("    print('hello world')")
-            lines.append("    original_function = None")
-            lines.append("    def hook_function(*args, **kwargs):")
-            lines.append("        if original_function:")
-            lines.append("            return original_function(*args, **kwargs)")
-            lines.append("bypass_template()")
-        else:
-            lines.append("// Bypass template for " + ext)
-            lines.append("void bypass_template() {")
-            lines.append("    printf(\"hello world\\n\");")
-            lines.append("}")
-        
-        lines.append("")
-        lines.append("-- ============================================")
-        lines.append("-- END OF BYPASS TEMPLATE")
-        lines.append("-- ============================================")
-        
-        bypass_content = "\n".join(lines)
-        out_path = "bypass_template_" + filename.replace('.txt', ext)
-        
-        with open(out_path, 'w') as f:
-            f.write(bypass_content)
+        features = re.findall(r'- (Player Movement|Networking/Replication|Damage/Health|Inventory|Anti-Cheat)', content)
+        findings = re.findall(r'\[(HIGH|MEDIUM|LOW)\] (.*?)(?:\n|$)', content)
 
-        await ctx.send("Template generated.", file=discord.File(out_path))
+        implementation = generate_implementation(content, ext, features, findings)
+        
+        out_path = "implementation" + ext
+        with open(out_path, 'w') as f:
+            f.write(implementation)
+
+        await ctx.send("Implementation generated.", file=discord.File(out_path))
         os.remove(file_path)
         os.remove(out_path)
 
@@ -733,7 +784,6 @@ async def generate_bypass(ctx):
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
     print("ERROR: No TOKEN found in environment variables")
-    print("Set your token in the hosting platform's environment variables")
 else:
     print("Starting bot with token...")
     bot.run(TOKEN)
