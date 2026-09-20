@@ -3,9 +3,11 @@ import os
 import re
 import asyncio
 import traceback
+import aiohttp
 from discord.ext import commands
 from datetime import datetime
 from collections import defaultdict
+from urllib.parse import urlparse
 
 try:
     from tree_sitter_languages import get_parser
@@ -56,6 +58,74 @@ CATEGORY_LABELS = {
     'encryption': 'ENCRYPTION / CRYPTOGRAPHY',
     'obfuscation': 'OBFUSCATION TECHNIQUES'
 }
+
+class ObfuscationDetector:
+    def __init__(self, content):
+        self.content = content
+        self.is_obfuscated = False
+        self.obfuscation_techniques = []
+        self.confidence = 0
+
+    def detect(self):
+        score = 0
+        
+        if re.search(r'[A-Za-z0-9+/]{50,}={0,2}', self.content):
+            self.obfuscation_techniques.append('Base64 encoded strings')
+            score += 20
+        
+        if re.search(r'\\x[0-9a-fA-F]{2}', self.content):
+            self.obfuscation_techniques.append('Hex encoded strings')
+            score += 15
+        
+        if re.search(r'\\u[0-9a-fA-F]{4}', self.content):
+            self.obfuscation_techniques.append('Unicode encoded strings')
+            score += 15
+        
+        var_names = re.findall(r'(?:var|let|const|local|function)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)', self.content)
+        if var_names:
+            avg_length = sum(len(v) for v in var_names) / len(var_names)
+            if avg_length < 3:
+                self.obfuscation_techniques.append('Extremely short variable names')
+                score += 25
+        
+        if re.search(r'(?:eval|exec|Function|loadstring|_G)', self.content):
+            self.obfuscation_techniques.append('Dynamic code execution')
+            score += 20
+        
+        if re.search(r'string\.char|String\.fromCharCode|chr\(', self.content):
+            self.obfuscation_techniques.append('Character code obfuscation')
+            score += 15
+        
+        if re.search(r'(?:\+\+|--)[\s]*[a-zA-Z_$]+', self.content):
+            self.obfuscation_techniques.append('Increment/decrement obfuscation')
+            score += 10
+        
+        if re.search(r'!\[\]\+\[\]', self.content) or re.search(r'\[\]\[\'\w+\'\]', self.content):
+            self.obfuscation_techniques.append('JavaScript bracket notation obfuscation')
+            score += 25
+        
+        if re.search(r'function\s*\([a-z]\)\s*\{[^\}]*\}', self.content):
+            self.obfuscation_techniques.append('Single-letter parameter functions')
+            score += 10
+        
+        if re.search(r'(?:0x[0-9a-fA-F]+)', self.content):
+            hex_count = len(re.findall(r'0x[0-9a-fA-F]+', self.content))
+            if hex_count > 10:
+                self.obfuscation_techniques.append('Hexadecimal number obfuscation')
+                score += 15
+        
+        if re.search(r'(?:split|join|concat)\s*\(', self.content):
+            self.obfuscation_techniques.append('String manipulation obfuscation')
+            score += 10
+        
+        if re.search(r'(?:self|_ENV|_G)\[.*?\]', self.content):
+            self.obfuscation_techniques.append('Global table access obfuscation')
+            score += 15
+        
+        self.confidence = min(score, 100)
+        self.is_obfuscated = score >= 30
+        
+        return self.is_obfuscated, self.obfuscation_techniques, self.confidence
 
 class SourceAnalyzer:
     def __init__(self, content, ext):
@@ -329,7 +399,7 @@ class ConfidenceEngine:
         return 'UNCERTAIN'
 
 class ReportGenerator:
-    def __init__(self, source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine):
+    def __init__(self, source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine, obfuscation=None):
         self.source = source
         self.symbols = symbols
         self.control_flow = control_flow
@@ -341,6 +411,7 @@ class ReportGenerator:
         self.game = game
         self.patterns = patterns
         self.confidence_engine = confidence_engine
+        self.obfuscation = obfuscation
 
     def generate(self):
         lines = []
@@ -350,6 +421,14 @@ class ReportGenerator:
         lines.append("Language: " + self.source.lang.upper())
         lines.append("Generated: " + datetime.utcnow().isoformat())
         lines.append("Lines: " + str(self.source.total_lines) + " | Chars: " + str(self.source.total_chars))
+        
+        if self.obfuscation:
+            is_obs, techniques, conf = self.obfuscation
+            lines.append("Obfuscation Detected: " + ("YES" if is_obs else "NO"))
+            if is_obs:
+                lines.append("Techniques: " + ", ".join(techniques))
+                lines.append("Confidence: " + str(conf) + "%")
+        
         lines.append("=" * 70)
         lines.append("")
 
@@ -562,6 +641,247 @@ def generate_implementation(analysis_text, target_lang, detected_features, secur
         lines.append("    print(f\"Enforced speed: {enforcer.current_speed}\")")
         lines.append("    enforcer.stop()")
         
+    elif target_lang in ['.js', '.ts']:
+        lines.append("class VelocityEnforcer {")
+        lines.append("    constructor(maxSpeed = 16) {")
+        lines.append("        this.maxSpeed = maxSpeed;")
+        lines.append("        this.currentSpeed = 0;")
+        lines.append("        this.running = true;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    start() {")
+        lines.append("        setInterval(() => this.enforce(), 100);")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    stop() {")
+        lines.append("        this.running = false;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    setSpeed(speed) {")
+        lines.append("        this.currentSpeed = speed;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    enforce() {")
+        lines.append("        if (this.currentSpeed > this.maxSpeed) {")
+        lines.append("            this.currentSpeed = this.maxSpeed;")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("class IntegrityVerifier {")
+        lines.append("    constructor(expectedHash) {")
+        lines.append("        this.expectedHash = expectedHash;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    async verify(data) {")
+        lines.append("        const encoder = new TextEncoder();")
+        lines.append("        const dataBuffer = encoder.encode(data);")
+        lines.append("        const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);")
+        lines.append("        const hashArray = Array.from(new Uint8Array(hashBuffer));")
+        lines.append("        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');")
+        lines.append("        return hashHex === this.expectedHash;")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("const enforcer = new VelocityEnforcer(16);")
+        lines.append("enforcer.start();")
+        lines.append("enforcer.setSpeed(20);")
+        lines.append("console.log(`Enforced speed: ${enforcer.currentSpeed}`);")
+        
+    elif target_lang == '.cs':
+        lines.append("using System;")
+        lines.append("using System.Threading;")
+        lines.append("using System.Security.Cryptography;")
+        lines.append("using System.Text;")
+        lines.append("")
+        lines.append("public class VelocityEnforcer")
+        lines.append("{")
+        lines.append("    private double maxSpeed;")
+        lines.append("    private double currentSpeed;")
+        lines.append("    private bool running;")
+        lines.append("")
+        lines.append("    public VelocityEnforcer(double max = 16.0)")
+        lines.append("    {")
+        lines.append("        maxSpeed = max;")
+        lines.append("        currentSpeed = 0.0;")
+        lines.append("        running = true;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void Start()")
+        lines.append("    {")
+        lines.append("        Thread thread = new Thread(EnforcementLoop);")
+        lines.append("        thread.IsBackground = true;")
+        lines.append("        thread.Start();")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void Stop()")
+        lines.append("    {")
+        lines.append("        running = false;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void SetSpeed(double speed)")
+        lines.append("    {")
+        lines.append("        currentSpeed = speed;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    private void EnforcementLoop()")
+        lines.append("    {")
+        lines.append("        while (running)")
+        lines.append("        {")
+        lines.append("            if (currentSpeed > maxSpeed)")
+        lines.append("                currentSpeed = maxSpeed;")
+        lines.append("            Thread.Sleep(100);")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("public class IntegrityVerifier")
+        lines.append("{")
+        lines.append("    private string expectedHash;")
+        lines.append("")
+        lines.append("    public IntegrityVerifier(string hash)")
+        lines.append("    {")
+        lines.append("        expectedHash = hash;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public bool Verify(string data)")
+        lines.append("    {")
+        lines.append("        using (SHA256 sha256 = SHA256.Create())")
+        lines.append("        {")
+        lines.append("            byte[] bytes = Encoding.UTF8.GetBytes(data);")
+        lines.append("            byte[] hash = sha256.ComputeHash(bytes);")
+        lines.append("            string computedHash = BitConverter.ToString(hash).Replace(\"-\", \"\").ToLower();")
+        lines.append("            return computedHash == expectedHash;")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("}")
+        
+    elif target_lang == '.java':
+        lines.append("import java.security.MessageDigest;")
+        lines.append("import java.security.NoSuchAlgorithmException;")
+        lines.append("")
+        lines.append("public class VelocityEnforcer {")
+        lines.append("    private double maxSpeed;")
+        lines.append("    private double currentSpeed;")
+        lines.append("    private boolean running;")
+        lines.append("")
+        lines.append("    public VelocityEnforcer(double max) {")
+        lines.append("        this.maxSpeed = max;")
+        lines.append("        this.currentSpeed = 0.0;")
+        lines.append("        this.running = true;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void start() {")
+        lines.append("        Thread thread = new Thread(this::enforcementLoop);")
+        lines.append("        thread.setDaemon(true);")
+        lines.append("        thread.start();")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void stop() {")
+        lines.append("        running = false;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public void setSpeed(double speed) {")
+        lines.append("        currentSpeed = speed;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    private void enforcementLoop() {")
+        lines.append("        while (running) {")
+        lines.append("            if (currentSpeed > maxSpeed) {")
+        lines.append("                currentSpeed = maxSpeed;")
+        lines.append("            }")
+        lines.append("            try {")
+        lines.append("                Thread.sleep(100);")
+        lines.append("            } catch (InterruptedException e) {")
+        lines.append("                Thread.currentThread().interrupt();")
+        lines.append("            }")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("class IntegrityVerifier {")
+        lines.append("    private String expectedHash;")
+        lines.append("")
+        lines.append("    public IntegrityVerifier(String hash) {")
+        lines.append("        this.expectedHash = hash;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    public boolean verify(String data) throws NoSuchAlgorithmException {")
+        lines.append("        MessageDigest sha256 = MessageDigest.getInstance(\"SHA-256\");")
+        lines.append("        byte[] hash = sha256.digest(data.getBytes());")
+        lines.append("        StringBuilder hexString = new StringBuilder();")
+        lines.append("        for (byte b : hash) {")
+        lines.append("            String hex = Integer.toHexString(0xff & b);")
+        lines.append("            if (hex.length() == 1) hexString.append('0');")
+        lines.append("            hexString.append(hex);")
+        lines.append("        }")
+        lines.append("        return hexString.toString().equals(expectedHash);")
+        lines.append("    }")
+        lines.append("}")
+        
+    elif target_lang == '.rs':
+        lines.append("use std::thread;")
+        lines.append("use std::time::Duration;")
+        lines.append("use sha2::{Sha256, Digest};")
+        lines.append("")
+        lines.append("pub struct VelocityEnforcer {")
+        lines.append("    max_speed: f64,")
+        lines.append("    current_speed: f64,")
+        lines.append("    running: bool,")
+        lines.append("}")
+        lines.append("")
+        lines.append("impl VelocityEnforcer {")
+        lines.append("    pub fn new(max: f64) -> Self {")
+        lines.append("        VelocityEnforcer {")
+        lines.append("            max_speed: max,")
+        lines.append("            current_speed: 0.0,")
+        lines.append("            running: true,")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    pub fn start(&mut self) {")
+        lines.append("        let mut enforcer = self.clone();")
+        lines.append("        thread::spawn(move || {")
+        lines.append("            enforcer.enforcement_loop();")
+        lines.append("        });")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    pub fn stop(&mut self) {")
+        lines.append("        self.running = false;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    pub fn set_speed(&mut self, speed: f64) {")
+        lines.append("        self.current_speed = speed;")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    fn enforcement_loop(&mut self) {")
+        lines.append("        while self.running {")
+        lines.append("            if self.current_speed > self.max_speed {")
+        lines.append("                self.current_speed = self.max_speed;")
+        lines.append("            }")
+        lines.append("            thread::sleep(Duration::from_millis(100));")
+        lines.append("        }")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("pub struct IntegrityVerifier {")
+        lines.append("    expected_hash: String,")
+        lines.append("}")
+        lines.append("")
+        lines.append("impl IntegrityVerifier {")
+        lines.append("    pub fn new(hash: String) -> Self {")
+        lines.append("        IntegrityVerifier { expected_hash: hash }")
+        lines.append("    }")
+        lines.append("")
+        lines.append("    pub fn verify(&self, data: &str) -> bool {")
+        lines.append("        let mut hasher = Sha256::new();")
+        lines.append("        hasher.update(data.as_bytes());")
+        lines.append("        let result = hasher.finalize();")
+        lines.append("        let computed_hash = format!(\"{:x}\", result);")
+        lines.append("        computed_hash == self.expected_hash")
+        lines.append("    }")
+        lines.append("}")
+        
     else:
         lines.append("#include <iostream>")
         lines.append("#include <thread>")
@@ -631,6 +951,80 @@ async def on_command_error(ctx, error):
 async def ping(ctx):
     await ctx.send("Pong! Bot is working.")
 
+@bot.command(name='get')
+async def fetch_file(ctx, url=None):
+    if not url:
+        await ctx.send("Usage: .get <URL>")
+        return
+
+    try:
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            await ctx.send("Invalid URL format. Please provide a complete URL (e.g., https://example.com/file.lua)")
+            return
+
+        await ctx.send("Fetching file from: " + url)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=30) as response:
+                if response.status != 200:
+                    await ctx.send("Failed to fetch file. Status code: " + str(response.status))
+                    return
+
+                content = await response.text()
+                
+                if not content or len(content.strip()) == 0:
+                    await ctx.send("The file is empty.")
+                    return
+
+                filename_match = re.search(r'/([^/]+\.(?:lua|py|js|ts|c|cpp|h|hpp|cs|java|rs|php|m|swift|go|rb|kt|sh|ps1|r|pl|ex|erl|hs|ml|zig|nim|v|d|sol))$', url)
+                if filename_match:
+                    filename = filename_match.group(1)
+                else:
+                    ext_match = re.search(r'\.([a-z0-9]+)(?:\?.*)?$', url)
+                    if ext_match:
+                        ext = "." + ext_match.group(1)
+                        filename = "fetched_file" + ext
+                    else:
+                        filename = "fetched_file.txt"
+
+                ext = os.path.splitext(filename)[1].lower()
+                lang = LANG_MAP.get(ext, 'unknown')
+
+                detector = ObfuscationDetector(content)
+                is_obfuscated, techniques, confidence = detector.detect()
+
+                embed = discord.Embed(
+                    title="File Analysis",
+                    description="**File:** " + filename + "\n**Language:** " + lang.upper() + "\n**Size:** " + str(len(content)) + " bytes",
+                    color=0x2ECC71 if not is_obfuscated else 0xE74C3C
+                )
+                embed.add_field(name="Obfuscation Detected", value="**YES**" if is_obfuscated else "**NO**", inline=True)
+                embed.add_field(name="Confidence", value=str(confidence) + "%", inline=True)
+                embed.add_field(name="Lines", value=str(len(content.splitlines())), inline=True)
+
+                if is_obfuscated:
+                    techniques_str = "\n".join(["• " + t for t in techniques])
+                    embed.add_field(name="Techniques Found", value=techniques_str[:1024], inline=False)
+                    embed.add_field(name="Warning", value="This file appears to be obfuscated. Analysis may be limited.", inline=False)
+
+                await ctx.send(embed=embed)
+
+                file_path = "temp_" + filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+
+                await ctx.send(file=discord.File(file_path, filename=filename))
+                os.remove(file_path)
+
+    except aiohttp.ClientError as e:
+        print("HTTP ERROR:", e)
+        await ctx.send("Failed to connect to the URL. Error: " + str(e))
+    except Exception as e:
+        print("FETCH ERROR:", e)
+        print(traceback.format_exc())
+        await ctx.send("Error fetching file: " + str(e))
+
 @bot.command(name='re')
 async def reverse_engineer(ctx):
     print("RE command received from", ctx.author)
@@ -663,6 +1057,9 @@ async def reverse_engineer(ctx):
 
         await asyncio.sleep(1)
         await msg.edit(embed=build_embed(1, filename, lang, 33, color=0xF39C12))
+
+        detector = ObfuscationDetector(content)
+        is_obfuscated, techniques, confidence = detector.detect()
 
         source = SourceAnalyzer(content, ext)
         ast_builder = ASTBuilder(content, lang)
@@ -702,13 +1099,14 @@ async def reverse_engineer(ctx):
             ("Classes", "`" + str(len(symbols.classes)) + "`"),
             ("Control Branches", "`" + str(control_flow.branches) + "`"),
             ("Security Findings", "`" + str(len(security.findings)) + "`"),
-            ("Game Features", "`" + str(len(game.game_features)) + "`")
+            ("Game Features", "`" + str(len(game.game_features)) + "`"),
+            ("Obfuscated", "`" + ("YES" if is_obfuscated else "NO") + "`")
         ]
         await msg.edit(embed=build_embed(2, filename, lang, 66, fields=phase2_fields, color=0xE67E22))
 
         await asyncio.sleep(1)
 
-        report_gen = ReportGenerator(source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine)
+        report_gen = ReportGenerator(source, symbols, control_flow, data_flow, call_graph, dependencies, behavioral, security, game, patterns, confidence_engine, (is_obfuscated, techniques, confidence) if is_obfuscated else None)
         report_content = report_gen.generate()
         
         out_path = "analysis_" + filename + ".txt"
