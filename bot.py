@@ -3,6 +3,8 @@ import os
 import re
 import asyncio
 import traceback
+import atexit
+import uuid
 import aiohttp
 import base64
 import random
@@ -27,7 +29,36 @@ except ImportError:
     LUA_PARSER_AVAILABLE = False
 
 intents = discord.Intents.all()
+
+# Runtime safety: prevent duplicate command handling in the same process.
+_processed_message_ids = set()
+_MAX_PROCESSED_IDS = 4096
+
+def _mark_message_processed(message_id):
+    if message_id in _processed_message_ids:
+        return False
+    _processed_message_ids.add(message_id)
+    if len(_processed_message_ids) > _MAX_PROCESSED_IDS:
+        _processed_message_ids.clear()
+        _processed_message_ids.add(message_id)
+    return True
+
+def _safe_filename(name, fallback="upload.txt"):
+    name = os.path.basename(name or "").replace("\\x00", "")
+    if not name or name in {".", ".."}:
+        return fallback
+    return name[:180]
+
 bot = commands.Bot(command_prefix='.', intents=intents, help_command=None)
+
+class DuplicateCommandEvent(commands.CommandError):
+    pass
+
+@bot.before_invoke
+async def prevent_duplicate_dispatch(ctx):
+    if not _mark_message_processed(ctx.message.id):
+        raise DuplicateCommandEvent()
+
 
 LANG_MAP = {
     '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
@@ -1935,7 +1966,7 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
+    if isinstance(error, (commands.CommandNotFound, DuplicateCommandEvent)):
         return
     print("COMMAND ERROR:", error)
     print(traceback.format_exc())
@@ -2223,7 +2254,7 @@ async def reverse_engineer(ctx):
         return
 
     attachment = ctx.message.attachments[0]
-    filename = attachment.filename
+    filename = _safe_filename(attachment.filename)
     ext = os.path.splitext(filename)[1].lower()
     lang = LANG_MAP.get(ext, 'unknown')
 
@@ -2234,7 +2265,8 @@ async def reverse_engineer(ctx):
         return
 
     try:
-        file_path = "temp_" + filename
+        file_path = os.path.join("tmp", f"{uuid.uuid4().hex}_{filename}")
+        os.makedirs("tmp", exist_ok=True)
         await attachment.save(file_path)
         print("File saved:", file_path)
 
@@ -2330,14 +2362,15 @@ async def generate_bypass(ctx):
         return
 
     attachment = ctx.message.attachments[0]
-    filename = attachment.filename
+    filename = _safe_filename(attachment.filename, "analysis.txt")
     
-    if not filename.endswith('.txt'):
+    if not filename.lower().endswith('.txt'):
         await ctx.send("The file must be a .txt analysis report.")
         return
 
     try:
-        file_path = "temp_" + filename
+        file_path = os.path.join("tmp", f"{uuid.uuid4().hex}_{filename}")
+        os.makedirs("tmp", exist_ok=True)
         await attachment.save(file_path)
 
         with open(file_path, 'r', errors='ignore') as f:
@@ -2355,8 +2388,8 @@ async def generate_bypass(ctx):
 
         implementation = generate_implementation(content, ext, features, findings)
         
-        out_path = "implementation" + ext
-        with open(out_path, 'w') as f:
+        out_path = os.path.join("tmp", f"implementation_{uuid.uuid4().hex}{ext}")
+        with open(out_path, 'w', encoding='utf-8') as f:
             f.write(implementation)
 
         await ctx.send("Implementation generated.", file=discord.File(out_path))
@@ -2372,5 +2405,29 @@ TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
     print("ERROR: No TOKEN found in environment variables")
 else:
-    print("Starting bot with token...")
-    bot.run(TOKEN)
+    # Prevent two local bot processes from using the same token simultaneously.
+    # This is the common cause of commands appearing to execute twice.
+    LOCK_FILE = os.path.join("tmp", "bot_instance.lock")
+    os.makedirs("tmp", exist_ok=True)
+    lock_fd = None
+    try:
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        os.close(lock_fd)
+        lock_fd = None
+
+        def _release_lock():
+            try:
+                os.remove(LOCK_FILE)
+            except FileNotFoundError:
+                pass
+
+        atexit.register(_release_lock)
+
+        print("Starting bot with token...")
+        bot.run(TOKEN)
+    except FileExistsError:
+        print("ERROR: Another bot instance is already running. Stop the old process before starting a new one.")
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
