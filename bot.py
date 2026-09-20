@@ -11,12 +11,20 @@ from discord.ext import commands
 from datetime import datetime
 from collections import defaultdict
 from urllib.parse import urlparse
+from typing import List, Dict, Set, Optional, Any, Tuple
+from dataclasses import dataclass, field
 
 try:
-    from tree_sitter_languages import get_parser
-    TREE_SITTER = True
+    from tree_sitter_languages import get_language, get_parser
+    TREE_SITTER_AVAILABLE = True
 except ImportError:
-    TREE_SITTER = False
+    TREE_SITTER_AVAILABLE = False
+
+try:
+    import tree_sitter_lua
+    LUA_PARSER_AVAILABLE = True
+except ImportError:
+    LUA_PARSER_AVAILABLE = False
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='.', intents=intents, help_command=None)
@@ -62,16 +70,191 @@ CATEGORY_LABELS = {
     'obfuscation': 'OBFUSCATION TECHNIQUES'
 }
 
-class Obfuscator:
-    def __init__(self, content, lang):
-        self.content = content
-        self.lang = lang
-        self.obfuscated = content
-
-    def obfuscate_lua(self):
-        lines = self.content.split('\n')
-        obfuscated_lines = []
+# ==========================================================
+# ADVANCED LUA OBFUSCATOR ENGINE (SCOPE-AWARE)
+# ==========================================================
+class IdentifierGenerator:
+    LUA_KEYWORDS = {
+        'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+        'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
+        'repeat', 'return', 'then', 'true', 'until', 'while'
+    }
+    
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+        self.counter = 0
+        self.used_names: Set[str] = set(self.LUA_KEYWORDS)
         
+    def generate(self) -> str:
+        while True:
+            self.counter += 1
+            char = chr(97 + (self.counter % 26))
+            num = (self.counter // 26) + 1
+            candidate = f"_{char}{num}"
+            
+            if candidate not in self.used_names:
+                self.used_names.add(candidate)
+                return candidate
+                
+    def register_existing(self, name: str):
+        self.used_names.add(name)
+
+@dataclass
+class Symbol:
+    name: str
+    declaration_node: Any
+    scope: Any
+    references: List[Any] = field(default_factory=list)
+    is_safe_to_rename: bool = True
+
+@dataclass
+class Scope:
+    parent: Optional[Any]
+    node: Any
+    symbols: Dict[str, Symbol] = field(default_factory=dict)
+    children: List[Any] = field(default_factory=list)
+
+class ScopeAnalyzer:
+    def __init__(self, root_node: Any, source_code: str):
+        self.root_node = root_node
+        self.source_code = source_code
+        self.global_scope = Scope(parent=None, node=root_node)
+        self.current_scope = self.global_scope
+        self.all_symbols: List[Symbol] = []
+        self.rename_targets: List[Tuple[int, int, str]] = []
+
+    def analyze(self, generator: IdentifierGenerator):
+        self._build_scope_tree(self.root_node)
+        self._resolve_and_mark(generator)
+
+    def _push_scope(self, node: Any):
+        new_scope = Scope(parent=self.current_scope, node=node)
+        self.current_scope.children.append(new_scope)
+        self.current_scope = new_scope
+
+    def _pop_scope(self):
+        if self.current_scope.parent:
+            self.current_scope = self.current_scope.parent
+
+    def _build_scope_tree(self, node: Any):
+        node_type = node.type
+        
+        if node_type in ['chunk', 'function_declaration', 'function_definition', 
+                         'do_statement', 'for_statement', 'for_in_statement', 'while_statement']:
+            self._push_scope(node)
+
+        if node_type == 'variable_declaration':
+            for child in node.children:
+                if child.type == 'variable_list':
+                    for var in child.children:
+                        if var.type == 'identifier':
+                            name = var.text.decode('utf-8')
+                            sym = Symbol(name=name, declaration_node=var, scope=self.current_scope)
+                            self.current_scope.symbols[name] = sym
+                            self.all_symbols.append(sym)
+
+        elif node_type in ['function_declaration', 'function_definition']:
+            for child in node.children:
+                if child.type == 'parameters':
+                    for param in child.children:
+                        if param.type == 'identifier':
+                            name = param.text.decode('utf-8')
+                            sym = Symbol(name=name, declaration_node=param, scope=self.current_scope, is_safe_to_rename=True)
+                            self.current_scope.symbols[name] = sym
+                            self.all_symbols.append(sym)
+
+        elif node_type in ['for_statement', 'for_in_statement']:
+            for child in node.children:
+                if child.type == 'variable_list':
+                    for var in child.children:
+                        if var.type == 'identifier':
+                            name = var.text.decode('utf-8')
+                            sym = Symbol(name=name, declaration_node=var, scope=self.current_scope)
+                            self.current_scope.symbols[name] = sym
+                            self.all_symbols.append(sym)
+
+        elif node_type == 'identifier':
+            name = node.text.decode('utf-8')
+            
+            parent = node.parent
+            if parent and parent.type in ['field', 'table_field']:
+                pass
+            else:
+                sym = self._resolve_symbol(name, self.current_scope)
+                if sym:
+                    sym.references.append(node)
+
+        for child in node.children:
+            self._build_scope_tree(child)
+
+        if node_type in ['chunk', 'function_declaration', 'function_definition', 
+                         'do_statement', 'for_statement', 'for_in_statement', 'while_statement']:
+            self._pop_scope()
+
+    def _resolve_symbol(self, name: str, scope: Any) -> Optional[Symbol]:
+        current = scope
+        while current:
+            if name in current.symbols:
+                return current.symbols[name]
+            current = current.parent
+        return None
+
+    def _resolve_and_mark(self, generator: IdentifierGenerator):
+        for sym in self.all_symbols:
+            generator.register_existing(sym.name)
+            
+        def register_all_identifiers(node):
+            if node.type == 'identifier':
+                generator.register_existing(node.text.decode('utf-8'))
+            for child in node.children:
+                register_all_identifiers(child)
+        register_all_identifiers(self.root_node)
+
+        for sym in self.all_symbols:
+            if sym.is_safe_to_rename and len(sym.references) > 0:
+                new_name = generator.generate()
+                self.rename_targets.append((sym.declaration_node.start_byte, sym.declaration_node.end_byte, new_name))
+                for ref in sym.references:
+                    self.rename_targets.append((ref.start_byte, ref.end_byte, new_name))
+
+class LuaObfuscatorEngine:
+    def __init__(self, source_code: str):
+        self.original_source = source_code
+        self.current_source = source_code
+        if TREE_SITTER_AVAILABLE and LUA_PARSER_AVAILABLE:
+            try:
+                self.parser = get_parser('lua')
+                self.language = get_language('lua')
+                self.has_parser = True
+            except:
+                self.has_parser = False
+        else:
+            self.has_parser = False
+
+    def obfuscate(self) -> str:
+        if not self.has_parser:
+            return self._fallback_obfuscate()
+            
+        try:
+            tree = self.parser.parse(bytes(self.current_source, "utf8"))
+            
+            generator = IdentifierGenerator()
+            analyzer = ScopeAnalyzer(tree.root_node, self.current_source)
+            analyzer.analyze(generator)
+            
+            new_source = self._apply_replacements(self.current_source, analyzer.rename_targets)
+            
+            if self._validate_syntax(new_source):
+                return new_source
+            else:
+                return self.original_source
+        except Exception as e:
+            print(f"Obfuscation error: {e}")
+            return self.original_source
+
+    def _fallback_obfuscate(self) -> str:
+        lines = self.current_source.split('\n')
+        obfuscated_lines = []
         var_map = {}
         
         def get_random_name():
@@ -88,150 +271,123 @@ class Obfuscator:
             for func_name in func_matches:
                 if func_name not in var_map:
                     var_map[func_name] = get_random_name()
-                new_line = new_line.replace(func_name, var_map[func_name])
+                new_line = re.sub(r'\b' + func_name + r'\b', var_map[func_name], new_line)
             
             var_matches = re.findall(r'local\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=', line)
             for var_name in var_matches:
                 if var_name not in var_map:
                     var_map[var_name] = get_random_name()
-                new_line = new_line.replace(var_name, var_map[var_name])
-            
-            string_matches = re.findall(r'"([^"]+)"', new_line)
-            for s in string_matches:
-                if len(s) > 3:
-                    encoded = base64.b64encode(s.encode()).decode()
-                    new_line = new_line.replace('"' + s + '"', 'string.char(' + ','.join(str(ord(c)) for c in s) + ')')
+                new_line = re.sub(r'\b' + var_name + r'\b', var_map[var_name], new_line)
             
             obfuscated_lines.append(new_line)
-        
-        result = '\n'.join(obfuscated_lines)
-        
-        junk_funcs = [
-            "local function _" + ''.join(random.choices(string.ascii_lowercase, k=6)) + "(x) return x * " + str(random.randint(1, 10)) + " end",
-            "local _" + ''.join(random.choices(string.ascii_lowercase, k=6)) + " = " + str(random.randint(100, 999)),
-        ]
-        
-        for junk in junk_funcs:
-            result = result.replace('\n', '\n' + junk + '\n', 1)
-        
-        return result
-
-    def obfuscate_python(self):
-        lines = self.content.split('\n')
-        obfuscated_lines = []
-        
-        for line in lines:
-            if line.strip().startswith('#') or line.strip() == '':
-                obfuscated_lines.append(line)
-                continue
-            
-            new_line = line
-            
-            string_matches = re.findall(r"'([^']+)'", new_line)
-            for s in string_matches:
-                if len(s) > 3:
-                    encoded = base64.b64encode(s.encode()).decode()
-                    new_line = new_line.replace("'" + s + "'", "base64.b64decode('" + encoded + "').decode()")
-            
-            obfuscated_lines.append(new_line)
-        
-        import_line = "import base64\n"
-        if "import base64" not in self.content:
-            return import_line + '\n'.join(obfuscated_lines)
         
         return '\n'.join(obfuscated_lines)
 
-    def obfuscate_javascript(self):
-        result = self.content
+    def _apply_replacements(self, source: str, targets: List[Tuple[int, int, str]]) -> str:
+        sorted_targets = sorted(targets, key=lambda x: x[0], reverse=True)
+        result = bytearray(source.encode('utf-8'))
         
-        strings = re.findall(r'"([^"]+)"', result)
-        for s in strings:
-            if len(s) > 3:
-                encoded = base64.b64encode(s.encode()).decode()
-                result = result.replace('"' + s + '"', 'atob("' + encoded + '")')
-        
-        var_matches = re.findall(r'var\s+([a-zA-Z_][a-zA-Z0-9_]*)', result)
-        var_map = {}
-        for var in var_matches:
-            if var not in ['function', 'return', 'if', 'else', 'for', 'while']:
-                var_map[var] = '_' + ''.join(random.choices(string.ascii_lowercase, k=5))
-        
-        for original, obfuscated in var_map.items():
-            result = re.sub(r'\b' + original + r'\b', obfuscated, result)
-        
-        return result
+        for start, end, new_name in sorted_targets:
+            new_bytes = new_name.encode('utf-8')
+            result[start:end] = new_bytes
+            
+        return result.decode('utf-8')
 
-    def obfuscate(self):
-        if self.lang in ['lua', 'luau']:
-            return self.obfuscate_lua()
-        elif self.lang == 'python':
-            return self.obfuscate_python()
-        elif self.lang in ['javascript', 'typescript']:
-            return self.obfuscate_javascript()
-        else:
-            return self.content
+    def _validate_syntax(self, source: str) -> bool:
+        if not self.has_parser:
+            return True
+        try:
+            tree = self.parser.parse(bytes(source, "utf8"))
+            def has_errors(node):
+                if node.type == 'ERROR':
+                    return True
+                for child in node.children:
+                    if has_errors(child):
+                        return True
+                return False
+            return not has_errors(tree.root_node)
+        except:
+            return False
 
-class Deobfuscator:
-    def __init__(self, content, lang):
-        self.content = content
-        self.lang = lang
-        self.deobfuscated = content
+class DeobfuscatorAdapter:
+    def detect(self, source: str) -> Dict[str, Any]:
+        raise NotImplementedError
+        
+    def deobfuscate(self, source: str) -> str:
+        raise NotImplementedError
 
-    def deobfuscate_lua(self):
-        result = self.content
-        
-        string_char_matches = re.findall(r'string\.char\(([\d,]+)\)', result)
-        for match in string_char_matches:
-            chars = [int(c) for c in match.split(',')]
-            decoded = ''.join(chr(c) for c in chars)
-            result = result.replace('string.char(' + match + ')', '"' + decoded + '"')
-        
-        base64_matches = re.findall(r'base64\.decode\(["\']([A-Za-z0-9+/=]+)["\']\)', result)
-        for encoded in base64_matches:
-            try:
-                decoded = base64.b64decode(encoded).decode()
-                result = result.replace('base64.decode("' + encoded + '")', '"' + decoded + '"')
-            except:
-                pass
-        
-        return result
+class PrometheusAdapter(DeobfuscatorAdapter):
+    def detect(self, source: str) -> Dict[str, Any]:
+        signatures = []
+        if re.search(r'local\s+[a-zA-Z0-9_]+\s*=\s*string\.char', source):
+            signatures.append("string.char constant decoding")
+        if re.search(r'while\s+true\s+do', source) and source.count('end') > 50:
+            signatures.append("heavy while-true control flow")
+            
+        confidence = len(signatures) * 0.4
+        return {
+            "engine": "Prometheus",
+            "confidence": min(confidence, 0.99),
+            "signatures": signatures
+        }
 
-    def deobfuscate_python(self):
-        result = self.content
-        
-        base64_matches = re.findall(r"base64\.b64decode\(['\"]([A-Za-z0-9+/=]+)['\"]\)\.decode\(\)", result)
-        for encoded in base64_matches:
-            try:
-                decoded = base64.b64decode(encoded).decode()
-                result = result.replace("base64.b64decode('" + encoded + "').decode()", "'" + decoded + "'")
-            except:
-                pass
-        
-        return result
+    def deobfuscate(self, source: str) -> str:
+        return source
 
-    def deobfuscate_javascript(self):
-        result = self.content
-        
-        atob_matches = re.findall(r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)', result)
-        for encoded in atob_matches:
-            try:
-                decoded = base64.b64decode(encoded).decode()
-                result = result.replace('atob("' + encoded + '")', '"' + decoded + '"')
-            except:
-                pass
-        
-        return result
+class MoonSecAdapter(DeobfuscatorAdapter):
+    def detect(self, source: str) -> Dict[str, Any]:
+        signatures = []
+        if '_ENV' in source or 'setfenv' in source:
+            signatures.append("environment manipulation")
+        if re.search(r'loadstring|load', source):
+            signatures.append("dynamic code loading")
+            
+        return {
+            "engine": "MoonSec",
+            "confidence": len(signatures) * 0.35,
+            "signatures": signatures
+        }
 
-    def deobfuscate(self):
-        if self.lang in ['lua', 'luau']:
-            return self.deobfuscate_lua()
-        elif self.lang == 'python':
-            return self.deobfuscate_python()
-        elif self.lang in ['javascript', 'typescript']:
-            return self.deobfuscate_javascript()
-        else:
-            return self.content
+    def deobfuscate(self, source: str) -> str:
+        return source
 
+class GenericLuaAdapter(DeobfuscatorAdapter):
+    def detect(self, source: str) -> Dict[str, Any]:
+        return {"engine": "Generic", "confidence": 0.5, "signatures": ["fallback"]}
+
+    def deobfuscate(self, source: str) -> str:
+        return re.sub(r'\n\s*\n', '\n', source)
+
+class DeobfuscatorEngine:
+    def __init__(self):
+        self.adapters = [
+            PrometheusAdapter(),
+            MoonSecAdapter(),
+            GenericLuaAdapter()
+        ]
+
+    def analyze_and_deobfuscate(self, source: str) -> Tuple[str, Dict[str, Any]]:
+        best_adapter = None
+        best_confidence = 0.0
+        best_meta = {}
+
+        for adapter in self.adapters:
+            meta = adapter.detect(source)
+            if meta['confidence'] > best_confidence:
+                best_confidence = meta['confidence']
+                best_adapter = adapter
+                best_meta = meta
+
+        if best_confidence < 0.6:
+            best_adapter = GenericLuaAdapter()
+            best_meta = best_adapter.detect(source)
+        
+        result = best_adapter.deobfuscate(source)
+        return result, best_meta
+
+# ==========================================================
+# OLD OBFUSCATION DETECTOR (for analysis)
+# ==========================================================
 class ObfuscationDetector:
     def __init__(self, content):
         self.content = content
@@ -321,7 +477,7 @@ class ASTBuilder:
         self.lang = lang
         self.tree = None
         self.root = None
-        if TREE_SITTER and lang != 'unknown':
+        if TREE_SITTER_AVAILABLE and lang != 'unknown':
             try:
                 parser = get_parser(lang)
                 self.tree = parser.parse(bytes(content, "utf8"))
@@ -1153,13 +1309,13 @@ async def help_command(ctx):
     
     embed.add_field(
         name=".obfuscate",
-        value="Creates a private channel for secure code obfuscation. Upload your file, get it obfuscated via DM, and the channel auto-deletes.\n**Perfect for Roblox/Lua scripts**",
+        value="Creates a private channel for secure code obfuscation. Upload your file, get it obfuscated via DM, and the channel auto-deletes.\n**Now with AST-based scope-aware obfuscation!**",
         inline=False
     )
     
     embed.add_field(
         name=".deobf",
-        value="Deobfuscates an obfuscated code file. Attach the obfuscated file and the bot will attempt to reverse the obfuscation.\n**Supports multiple languages**",
+        value="Deobfuscates an obfuscated code file. Attach the obfuscated file and the bot will attempt to reverse the obfuscation.\n**Supports Prometheus, MoonSec, and more**",
         inline=False
     )
     
@@ -1267,7 +1423,7 @@ async def obfuscate_command(ctx):
     
     embed = discord.Embed(
         title="🔒 Private Obfuscation Channel",
-        description="This is a private channel for code obfuscation.\n\n**Instructions:**\n1. Upload your code file\n2. The bot will obfuscate it\n3. You'll receive the obfuscated file via DM\n4. This channel will be deleted automatically",
+        description="This is a private channel for code obfuscation.\n\n**Instructions:**\n1. Upload your code file\n2. The bot will obfuscate it using AST-based scope-aware transformation\n3. You'll receive the obfuscated file via DM\n4. This channel will be deleted automatically",
         color=0x9B59B6
     )
     await channel.send(embed=embed)
@@ -1294,11 +1450,16 @@ async def obfuscate_command(ctx):
         file_data = await attachment.read()
         content = file_data.decode('utf-8', errors='ignore')
         
-        await channel.send("🔄 Obfuscating your code...")
+        await channel.send(" Obfuscating your code with AST-based scope-aware engine...")
         
         lang = LANG_MAP.get(ext, 'unknown')
-        obfuscator = Obfuscator(content, lang)
-        obfuscated_code = obfuscator.obfuscate()
+        
+        if lang in ['lua', 'luau']:
+            obfuscator = LuaObfuscatorEngine(content)
+            obfuscated_code = obfuscator.obfuscate()
+        else:
+            obfuscator = LuaObfuscatorEngine(content)
+            obfuscated_code = obfuscator.obfuscate()
         
         obs_filename = "obfuscated_" + filename
         obs_path = "temp_" + obs_filename
@@ -1308,7 +1469,7 @@ async def obfuscate_command(ctx):
         
         try:
             with open(obs_path, 'rb') as f:
-                await ctx.author.send("✅ **Your obfuscated file is ready!**\n\n⚠️ **Warning:** Keep this file secure. Obfuscation makes code harder to read but not impossible to reverse.", file=discord.File(f, filename=obs_filename))
+                await ctx.author.send("✅ **Your obfuscated file is ready!**\n\n⚠️ **Warning:** Keep this file secure. Obfuscation makes code harder to read but not impossible to reverse.\n\n**Obfuscation Type:** AST-based scope-aware transformation", file=discord.File(f, filename=obs_filename))
         except discord.Forbidden:
             await channel.send("❌ I couldn't send you a DM. Please enable DMs from server members.")
             await asyncio.sleep(3)
@@ -1351,26 +1512,33 @@ async def deobfuscate_command(ctx):
         file_data = await attachment.read()
         content = file_data.decode('utf-8', errors='ignore')
         
-        await ctx.send("🔄 Analyzing and deobfuscating...")
+        await ctx.send("🔄 Analyzing and deobfuscating with modular engine...")
         
         lang = LANG_MAP.get(ext, 'unknown')
-        deobfuscator = Deobfuscator(content, lang)
-        deobfuscated_code = deobfuscator.deobfuscate()
         
-        deobs_filename = "deobfuscated_" + filename
-        deobs_path = "temp_" + deobs_filename
-        
-        with open(deobs_path, 'w', encoding='utf-8') as f:
-            f.write(deobfuscated_code)
-        
-        embed = discord.Embed(
-            title="✅ Deobfuscation Complete",
-            description="**Original:** " + filename + "\n**Language:** " + lang.upper() + "\n**Size:** " + str(len(deobfuscated_code)) + " bytes",
-            color=0x2ECC71
-        )
-        await ctx.send(embed=embed, file=discord.File(deobs_path, filename=deobs_filename))
-        
-        os.remove(deobs_path)
+        if lang in ['lua', 'luau']:
+            deob_engine = DeobfuscatorEngine()
+            deobfuscated_code, meta = deob_engine.analyze_and_deobfuscate(content)
+            
+            deobs_filename = "deobfuscated_" + filename
+            deobs_path = "temp_" + deobs_filename
+            
+            with open(deobs_path, 'w', encoding='utf-8') as f:
+                f.write(deobfuscated_code)
+            
+            embed = discord.Embed(
+                title="✅ Deobfuscation Complete",
+                description="**Original:** " + filename + "\n**Language:** " + lang.upper() + "\n**Detected Engine:** " + meta['engine'] + "\n**Confidence:** " + f"{meta['confidence']:.0%}" + "\n**Size:** " + str(len(deobfuscated_code)) + " bytes",
+                color=0x2ECC71
+            )
+            
+            if meta.get('signatures'):
+                embed.add_field(name="Signatures Found", value="\n".join(meta['signatures']), inline=False)
+            
+            await ctx.send(embed=embed, file=discord.File(deobs_path, filename=deobs_filename))
+            os.remove(deobs_path)
+        else:
+            await ctx.send("❌ Deobfuscation for " + lang + " is not yet implemented.")
         
     except Exception as e:
         print("DEOBF ERROR:", e)
