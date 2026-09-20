@@ -4,6 +4,7 @@ import re
 import asyncio
 import traceback
 import atexit
+import sqlite3
 import uuid
 import aiohttp
 import base64
@@ -30,18 +31,37 @@ except ImportError:
 
 intents = discord.Intents.all()
 
-# Runtime safety: prevent duplicate command handling in the same process.
-_processed_message_ids = set()
-_MAX_PROCESSED_IDS = 4096
+# Runtime safety: prevent the same Discord message from being handled
+# more than once, including when multiple local bot processes are running.
+_DEDUPE_DB = os.path.join("tmp", "command_dedupe.sqlite3")
+os.makedirs("tmp", exist_ok=True)
 
-def _mark_message_processed(message_id):
-    if message_id in _processed_message_ids:
-        return False
-    _processed_message_ids.add(message_id)
-    if len(_processed_message_ids) > _MAX_PROCESSED_IDS:
-        _processed_message_ids.clear()
-        _processed_message_ids.add(message_id)
-    return True
+def _claim_message(message_id):
+    conn = sqlite3.connect(_DEDUPE_DB, timeout=5)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS processed_messages "
+            "(message_id TEXT PRIMARY KEY, created_at REAL NOT NULL)"
+        )
+        try:
+            conn.execute(
+                "INSERT INTO processed_messages(message_id, created_at) VALUES (?, ?)",
+                (str(message_id), datetime.utcnow().timestamp())
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        finally:
+            # Keep the DB small.
+            conn.execute(
+                "DELETE FROM processed_messages WHERE created_at < ?",
+                (datetime.utcnow().timestamp() - 86400,)
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
 def _safe_filename(name, fallback="upload.txt"):
     name = os.path.basename(name or "").replace("\\x00", "")
@@ -56,7 +76,7 @@ class DuplicateCommandEvent(commands.CommandError):
 
 @bot.before_invoke
 async def prevent_duplicate_dispatch(ctx):
-    if not _mark_message_processed(ctx.message.id):
+    if not _claim_message(ctx.message.id):
         raise DuplicateCommandEvent()
 
 
