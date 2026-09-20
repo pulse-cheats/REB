@@ -217,6 +217,669 @@ class ScopeAnalyzer:
                 for ref in sym.references:
                     self.rename_targets.append((ref.start_byte, ref.end_byte, new_name))
 
+
+# ==========================================================
+# ADVANCED, CONSERVATIVE LUA/LUAU TRANSFORMATION LAYER
+# ==========================================================
+# This layer intentionally preserves the original public classes and commands.
+# It adds a lexer-first, scope-aware transformer that never rewrites inside
+# strings/comments/table keys and rolls back on validation failure.
+
+@dataclass
+class LuaToken:
+    kind: str
+    value: str
+    start: int
+    end: int
+    line: int
+    column: int
+
+
+class LuaLexer:
+    KEYWORDS = {
+        'and','break','do','else','elseif','end','false','for','function','goto',
+        'if','in','local','nil','not','or','repeat','return','then','true','until','while'
+    }
+
+    def __init__(self, source: str):
+        self.source = source
+        self.tokens: List[LuaToken] = []
+
+    def tokenize(self) -> List[LuaToken]:
+        s = self.source
+        n = len(s)
+        i = 0
+        line = 1
+        col = 1
+
+        def advance(segment: str):
+            nonlocal line, col
+            parts = segment.splitlines(True)
+            if len(parts) > 1:
+                line += len(parts) - 1
+                col = len(parts[-1]) + 1
+            else:
+                col += len(segment)
+
+        while i < n:
+            c = s[i]
+
+            if c in ' \t\r\n':
+                j = i + 1
+                while j < n and s[j] in ' \t\r\n':
+                    j += 1
+                advance(s[i:j]); i = j
+                continue
+
+            # Lua comments, including long comments.
+            if s.startswith('--', i):
+                start, sl, sc = i, line, col
+                if s.startswith('--[[', i):
+                    end = s.find(']]', i + 4)
+                    j = n if end < 0 else end + 2
+                else:
+                    end = s.find('\n', i + 2)
+                    j = n if end < 0 else end
+                value = s[i:j]
+                self.tokens.append(LuaToken('comment', value, start, j, sl, sc))
+                advance(value); i = j
+                continue
+
+            # Quoted strings.
+            if c in ("'", '"'):
+                start, sl, sc = i, line, col
+                quote = c
+                j = i + 1
+                escaped = False
+                while j < n:
+                    ch = s[j]
+                    if escaped:
+                        escaped = False
+                    elif ch == '\\':
+                        escaped = True
+                    elif ch == quote:
+                        j += 1
+                        break
+                    j += 1
+                value = s[i:j]
+                self.tokens.append(LuaToken('string', value, start, j, sl, sc))
+                advance(value); i = j
+                continue
+
+            # Long bracket strings.
+            if c == '[':
+                m = re.match(r'\[(=*)\[', s[i:])
+                if m:
+                    opener = m.group(0)
+                    closer = ']' + m.group(1) + ']'
+                    end = s.find(closer, i + len(opener))
+                    j = n if end < 0 else end + len(closer)
+                    value = s[i:j]
+                    self.tokens.append(LuaToken('string', value, i, j, line, col))
+                    advance(value); i = j
+                    continue
+
+            # Identifiers / keywords.
+            if c.isalpha() or c == '_':
+                j = i + 1
+                while j < n and (s[j].isalnum() or s[j] == '_'):
+                    j += 1
+                value = s[i:j]
+                kind = 'keyword' if value in self.KEYWORDS else 'identifier'
+                self.tokens.append(LuaToken(kind, value, i, j, line, col))
+                advance(value); i = j
+                continue
+
+            # Numbers.
+            if c.isdigit() or (c == '.' and i + 1 < n and s[i + 1].isdigit()):
+                m = re.match(
+                    r'(?:0[xX][0-9A-Fa-f]+(?:\.[0-9A-Fa-f]*)?|'
+                    r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)',
+                    s[i:]
+                )
+                value = m.group(0) if m else c
+                j = i + len(value)
+                self.tokens.append(LuaToken('number', value, i, j, line, col))
+                advance(value); i = j
+                continue
+
+            # Multi-character operators.
+            matched = None
+            for op in ('...', '==', '~=', '<=', '>=', '::', '->', '//', '<<', '>>', '..'):
+                if s.startswith(op, i):
+                    matched = op
+                    break
+            if matched:
+                j = i + len(matched)
+                self.tokens.append(LuaToken('symbol', matched, i, j, line, col))
+                advance(matched); i = j
+                continue
+
+            self.tokens.append(LuaToken('symbol', c, i, i + 1, line, col))
+            advance(c); i += 1
+
+        return self.tokens
+
+
+@dataclass
+class LuaBinding:
+    name: str
+    new_name: str
+    declaration_index: int
+    scope_id: int
+    references: List[int] = field(default_factory=list)
+
+
+@dataclass
+class LuaScopeFrame:
+    scope_id: int
+    parent_id: Optional[int]
+    start_index: int
+    end_index: int
+    kind: str
+    bindings: Dict[str, LuaBinding] = field(default_factory=dict)
+
+
+class AdvancedLuaRenamer:
+    """
+    Conservative lexical/scope-aware renamer.
+
+    It intentionally renames only local declarations and parameters whose
+    scope can be established without guessing. Globals, table fields,
+    method names, labels, strings and comments are left untouched.
+    """
+
+    def __init__(self, source: str, seed: int = 1337):
+        self.source = source
+        self.tokens = LuaLexer(source).tokenize()
+        self.generator = IdentifierGenerator(seed=seed)
+        self.scopes: List[LuaScopeFrame] = []
+        self.replacements: List[Tuple[int, int, str]] = []
+        self.diagnostics: List[str] = []
+
+    def _is_sig(self, i: int) -> bool:
+        return 0 <= i < len(self.tokens) and self.tokens[i].kind not in ('comment',)
+
+    def _next_sig(self, i: int) -> Optional[int]:
+        i += 1
+        while i < len(self.tokens):
+            if self.tokens[i].kind != 'comment':
+                return i
+            i += 1
+        return None
+
+    def _prev_sig(self, i: int) -> Optional[int]:
+        i -= 1
+        while i >= 0:
+            if self.tokens[i].kind != 'comment':
+                return i
+            i -= 1
+        return None
+
+    def _scope_at(self, index: int) -> Optional[LuaScopeFrame]:
+        candidates = [
+            s for s in self.scopes
+            if s.start_index <= index <= s.end_index
+        ]
+        if not candidates:
+            return self.scopes[0] if self.scopes else None
+        return max(candidates, key=lambda x: x.start_index)
+
+    def _find_matching_end(self, start: int) -> Optional[int]:
+        depth = 0
+        i = start
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.kind == 'keyword':
+                if t.value in ('function', 'do', 'then', 'for', 'while', 'repeat'):
+                    depth += 1
+                elif t.value == 'end':
+                    if depth == 0:
+                        return i
+                    depth -= 1
+                elif t.value == 'until' and depth == 0:
+                    return i
+            i += 1
+        return None
+
+    def _matching_block_end(self, start: int, initial: Optional[str] = None) -> int:
+        # Conservative block matcher. If uncertain, end at file end and
+        # validation will prevent unsafe replacements from being committed.
+        stack = [initial] if initial else []
+        i = start
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.kind == 'keyword':
+                if t.value in ('function', 'do', 'for', 'while', 'if'):
+                    stack.append(t.value)
+                elif t.value == 'repeat':
+                    stack.append('repeat')
+                elif t.value == 'end':
+                    if stack:
+                        stack.pop()
+                        if not stack:
+                            return i
+                elif t.value == 'until':
+                    if stack and stack[-1] == 'repeat':
+                        stack.pop()
+                        if not stack:
+                            return i
+            i += 1
+        return len(self.tokens) - 1
+
+    def _add_scope(self, start: int, end: int, kind: str, parent: Optional[int]) -> int:
+        sid = len(self.scopes)
+        self.scopes.append(LuaScopeFrame(sid, parent, start, end, kind))
+        return sid
+
+    def _find_parent_scope(self, index: int) -> Optional[int]:
+        candidates = [
+            s for s in self.scopes
+            if s.start_index <= index <= s.end_index
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x.start_index).scope_id
+
+    def _build_scopes(self):
+        if not self.tokens:
+            return
+
+        root = self._add_scope(0, len(self.tokens) - 1, 'chunk', None)
+
+        # Add function body scopes. We deliberately avoid trying to model
+        # every Lua grammar production; uncertain constructs remain untouched.
+        for i, t in enumerate(self.tokens):
+            if t.kind == 'keyword' and t.value == 'function':
+                close_paren = None
+                depth = 0
+                j = self._next_sig(i)
+                while j is not None and j < len(self.tokens):
+                    if self.tokens[j].value == '(':
+                        depth += 1
+                    elif self.tokens[j].value == ')':
+                        depth -= 1
+                        if depth == 0:
+                            close_paren = j
+                            break
+                    j = self._next_sig(j)
+                if close_paren is None:
+                    continue
+
+                body_end = self._matching_block_end(close_paren + 1, 'function')
+                self._add_scope(close_paren + 1, body_end, 'function', root)
+
+        # Re-parent nested function scopes by containment. This is essential
+        # for closure/upvalue resolution: a nested function must see bindings
+        # from its lexical parent instead of jumping directly to the chunk.
+        for child in self.scopes:
+            if child.scope_id == root:
+                continue
+            parents = [
+                p for p in self.scopes
+                if p.scope_id != child.scope_id
+                and p.start_index <= child.start_index
+                and p.end_index >= child.end_index
+            ]
+            if parents:
+                parent = max(parents, key=lambda p: p.start_index)
+                child.parent_id = parent.scope_id
+
+        self.scopes.sort(key=lambda s: (s.start_index, -s.end_index))
+
+    def _scope_for_index(self, index: int) -> LuaScopeFrame:
+        candidates = [
+            s for s in self.scopes
+            if s.start_index <= index <= s.end_index
+        ]
+        return max(candidates, key=lambda s: s.start_index) if candidates else self.scopes[0]
+
+    def _reserve_names(self):
+        for t in self.tokens:
+            if t.kind == 'identifier':
+                self.generator.register_existing(t.value)
+
+    def _add_binding(self, token_index: int, scope: LuaScopeFrame):
+        token = self.tokens[token_index]
+        if token.kind != 'identifier':
+            return None
+        if token.value in scope.bindings:
+            return scope.bindings[token.value]
+        new_name = self.generator.generate()
+        binding = LuaBinding(token.value, new_name, token_index, scope.scope_id)
+        scope.bindings[token.value] = binding
+        self.replacements.append((token.start, token.end, new_name))
+        return binding
+
+    def _resolve(self, name: str, scope: LuaScopeFrame) -> Optional[LuaBinding]:
+        current = scope
+        seen = set()
+        while current and current.scope_id not in seen:
+            seen.add(current.scope_id)
+            if name in current.bindings:
+                return current.bindings[name]
+            if current.parent_id is None:
+                break
+            current = self.scopes[current.parent_id]
+        return None
+
+    def _identifier_is_table_key(self, i: int) -> bool:
+        prev_i = self._prev_sig(i)
+        next_i = self._next_sig(i)
+        if prev_i is not None and self.tokens[prev_i].value == '.':
+            return True
+        if prev_i is not None and self.tokens[prev_i].value == '::':
+            return True
+        if next_i is not None and self.tokens[next_i].value == '::':
+            return True
+        # key = value inside a table constructor
+        if next_i is not None and self.tokens[next_i].value == '=':
+            if prev_i is not None and self.tokens[prev_i].value in ('{', ','):
+                return True
+        return False
+
+    def _collect_parameters(self, function_index: int, body_scope: LuaScopeFrame):
+        # Find the first parameter list following 'function'.
+        i = self._next_sig(function_index)
+        while i is not None and i < len(self.tokens):
+            if self.tokens[i].value == '(':
+                break
+            if self.tokens[i].value in ('do', 'end', ';'):
+                return
+            i = self._next_sig(i)
+        if i is None or self.tokens[i].value != '(':
+            return
+        depth = 1
+        j = i + 1
+        while j < len(self.tokens) and depth:
+            t = self.tokens[j]
+            if t.kind == 'comment':
+                j += 1
+                continue
+            if t.value == '(':
+                depth += 1
+            elif t.value == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1 and t.kind == 'identifier':
+                prev_i = self._prev_sig(j)
+                if prev_i is None or self.tokens[prev_i].value in ('(', ','):
+                    self._add_binding(j, body_scope)
+            j += 1
+
+    def _collect_local_declaration(self, i: int, scope: LuaScopeFrame):
+        # local <name>[, <name>...] [= ...]
+        j = self._next_sig(i)
+        if j is None:
+            return
+        if self.tokens[j].kind == 'keyword' and self.tokens[j].value == 'function':
+            name_i = self._next_sig(j)
+            if name_i is not None and self.tokens[name_i].kind == 'identifier':
+                self._add_binding(name_i, scope)
+            return
+
+        while j is not None and j < len(self.tokens):
+            t = self.tokens[j]
+            if t.kind != 'identifier':
+                break
+            self._add_binding(j, scope)
+            nxt = self._next_sig(j)
+            if nxt is None or self.tokens[nxt].value != ',':
+                break
+            j = self._next_sig(nxt)
+
+    def _collect_for_declaration(self, i: int, scope: LuaScopeFrame):
+        j = self._next_sig(i)
+        while j is not None and j < len(self.tokens):
+            t = self.tokens[j]
+            if t.kind != 'identifier':
+                break
+            self._add_binding(j, scope)
+            nxt = self._next_sig(j)
+            if nxt is None or self.tokens[nxt].value not in (',',):
+                break
+            j = self._next_sig(nxt)
+
+    def transform(self) -> Tuple[str, Dict[str, Any]]:
+        if not self.tokens:
+            return self.source, {'changed': False, 'replacements': 0, 'warnings': []}
+
+        self._build_scopes()
+        self._reserve_names()
+
+        # Declarations.
+        for i, t in enumerate(self.tokens):
+            if t.kind != 'keyword':
+                continue
+            scope = self._scope_for_index(i)
+
+            if t.value == 'local':
+                self._collect_local_declaration(i, scope)
+            elif t.value == 'for':
+                self._collect_for_declaration(i, scope)
+
+        # Function parameters belong to the nearest function scope.
+        for i, t in enumerate(self.tokens):
+            if t.kind == 'keyword' and t.value == 'function':
+                body = None
+                candidates = [s for s in self.scopes if s.kind == 'function' and s.start_index >= i]
+                if candidates:
+                    body = min(candidates, key=lambda s: s.start_index)
+                if body:
+                    self._collect_parameters(i, body)
+
+        # References.
+        for i, t in enumerate(self.tokens):
+            if t.kind != 'identifier':
+                continue
+            if self._identifier_is_table_key(i):
+                continue
+
+            scope = self._scope_for_index(i)
+            binding = self._resolve(t.value, scope)
+            if not binding:
+                continue
+
+            # Don't touch declaration twice.
+            if i == binding.declaration_index:
+                continue
+
+            binding.references.append(i)
+            self.replacements.append((t.start, t.end, binding.new_name))
+
+        # Deduplicate exact replacement ranges.
+        unique = {}
+        for start, end, name in self.replacements:
+            unique[(start, end)] = name
+        replacements = [(s, e, n) for (s, e), n in unique.items()]
+
+        # Apply right-to-left to preserve offsets.
+        result = self.source
+        for start, end, name in sorted(replacements, reverse=True):
+            result = result[:start] + name + result[end:]
+
+        return result, {
+            'changed': result != self.source,
+            'replacements': len(replacements),
+            'scopes': len(self.scopes),
+            'warnings': self.diagnostics,
+        }
+
+
+class AdvancedLuaObfuscatorEngine:
+    def __init__(self, source_code: str, seed: int = 1337):
+        self.original_source = source_code
+        self.seed = seed
+        self.validation_errors: List[str] = []
+
+    def _tree_sitter_valid(self, source: str) -> bool:
+        if not (TREE_SITTER_AVAILABLE and LUA_PARSER_AVAILABLE):
+            # The lexer itself is still guaranteed not to rewrite strings/comments.
+            return True
+        try:
+            parser = get_parser('lua')
+            tree = parser.parse(source.encode('utf-8'))
+            def has_error(node):
+                if node.type == 'ERROR':
+                    return True
+                return any(has_error(c) for c in node.children)
+            return not has_error(tree.root_node)
+        except Exception as exc:
+            self.validation_errors.append(str(exc))
+            return False
+
+    def obfuscate(self) -> str:
+        # Transactional pipeline: every transformation is validated before commit.
+        try:
+            renamer = AdvancedLuaRenamer(self.original_source, seed=self.seed)
+            candidate, metadata = renamer.transform()
+
+            if not self._tree_sitter_valid(candidate):
+                self.validation_errors.append("Parser rejected transformed source; rollback applied.")
+                return self.original_source
+
+            return candidate
+        except Exception as exc:
+            self.validation_errors.append(f"Transformation failed: {exc}")
+            return self.original_source
+
+
+# ==========================================================
+# ADVANCED OBFUSCATION DETECTION / SAFE DEOBF ANALYSIS
+# ==========================================================
+
+class AdvancedObfuscationDetector(ObfuscationDetector):
+    ENGINE_SIGNATURES = {
+        'Prometheus': [
+            r'Prometheus', r'LPH!', r'local\s+LPH', r'protected\s+call',
+            r'string\.char\s*\(', r'bit32\.', r'getfenv\s*\('
+        ],
+        'MoonSec': [
+            r'MoonSec', r'MoonSecV\d', r'__MSEC', r'loadstring\s*\(',
+            r'_ENV\s*\[', r'setfenv\s*\('
+        ],
+        'IronBrew2': [
+            r'IronBrew', r'IronBrew2', r'bit32\.', r'VM\s*=', r'VIP\s*=',
+            r'local\s+VIP', r'local\s+INS'
+        ],
+        'MoonVeil': [
+            r'MoonVeil', r'__MV', r'MV_', r'Veil'
+        ],
+        'ChaoticGood': [
+            r'ChaoticGood', r'chaotic', r'control.?flow'
+        ],
+    }
+
+    def detect_engines(self) -> List[Dict[str, Any]]:
+        results = []
+        source = self.content
+        for engine, patterns in self.ENGINE_SIGNATURES.items():
+            hits = []
+            for pattern in patterns:
+                try:
+                    if re.search(pattern, source, re.IGNORECASE):
+                        hits.append(pattern)
+                except re.error:
+                    continue
+            if hits:
+                # Multiple independent signatures raise confidence, but never
+                # claim certainty from one generic construct.
+                confidence = min(0.99, 0.35 + 0.13 * len(hits))
+                results.append({
+                    'engine': engine,
+                    'confidence': confidence,
+                    'signatures': hits,
+                    'warnings': []
+                })
+        results.sort(key=lambda x: x['confidence'], reverse=True)
+        return results
+
+
+class SafeLuaConstantFolder:
+    """Conservative source-level cleanup; never executes arbitrary code."""
+
+    @staticmethod
+    def fold_string_char(source: str) -> str:
+        # Only fold literal numeric string.char calls.
+        pattern = re.compile(
+            r'string\.char\s*\(\s*((?:0|[1-9]\d*)(?:\s*,\s*(?:0|[1-9]\d*))*)\s*\)'
+        )
+
+        def repl(match):
+            raw = match.group(1)
+            try:
+                nums = [int(x.strip()) for x in raw.split(',')]
+                if not nums or any(n < 0 or n > 255 for n in nums):
+                    return match.group(0)
+                value = ''.join(chr(n) for n in nums)
+                # Lua-compatible double quoted literal.
+                escaped = value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+                return '"' + escaped + '"'
+            except Exception:
+                return match.group(0)
+
+        return pattern.sub(repl, source)
+
+
+class AdvancedDeobfuscatorEngine:
+    """
+    Defensive, conservative deobfuscation pipeline.
+
+    It detects likely obfuscation families and performs only semantics-safe
+    normalization/constant folding. It does not attempt to defeat protected
+    virtual machines, anti-tamper checks, or proprietary runtime protections.
+    """
+
+    def __init__(self):
+        self.detector_cache = {}
+
+    def analyze(self, source: str) -> Dict[str, Any]:
+        detector = AdvancedObfuscationDetector(source)
+        is_obs, techniques, confidence = detector.detect()
+        engines = detector.detect_engines()
+
+        best = engines[0] if engines else {
+            'engine': 'Generic Lua',
+            'confidence': 0.50,
+            'signatures': ['No engine-specific signature']
+        }
+
+        return {
+            'is_obfuscated': is_obs,
+            'techniques': techniques,
+            'confidence': confidence / 100.0,
+            'engine': best['engine'],
+            'engine_confidence': best['confidence'],
+            'signatures': best.get('signatures', []),
+            'candidates': engines,
+            'warnings': [
+                'Engine detection is heuristic and may produce false positives.',
+                'Only conservative source-level transformations are applied.'
+            ]
+        }
+
+    def transform(self, source: str) -> Tuple[str, Dict[str, Any]]:
+        meta = self.analyze(source)
+        candidate = source
+        changes = []
+
+        folded = SafeLuaConstantFolder.fold_string_char(candidate)
+        if folded != candidate:
+            candidate = folded
+            changes.append('literal string.char folding')
+
+        # Normalize excessive blank lines only; never alter tokens otherwise.
+        normalized = re.sub(r'\n[ \t]*\n[ \t]*\n+', '\n\n', candidate)
+        if normalized != candidate:
+            candidate = normalized
+            changes.append('whitespace normalization')
+
+        meta['changes'] = changes
+        meta['output_size'] = len(candidate)
+        return candidate, meta
+
+
 class LuaObfuscatorEngine:
     def __init__(self, source_code: str):
         self.original_source = source_code
@@ -1455,11 +2118,15 @@ async def obfuscate_command(ctx):
         lang = LANG_MAP.get(ext, 'unknown')
         
         if lang in ['lua', 'luau']:
-            obfuscator = LuaObfuscatorEngine(content)
+            obfuscator = AdvancedLuaObfuscatorEngine(content)
             obfuscated_code = obfuscator.obfuscate()
         else:
-            obfuscator = LuaObfuscatorEngine(content)
-            obfuscated_code = obfuscator.obfuscate()
+            # Preserve the existing command/API, but do not run a Lua
+            # transformer over non-Lua source files.
+            await channel.send("❌ Advanced obfuscation is currently available for Lua/Luau only.")
+            await asyncio.sleep(2)
+            await channel.delete()
+            return
         
         obs_filename = "obfuscated_" + filename
         obs_path = "temp_" + obs_filename
@@ -1517,9 +2184,9 @@ async def deobfuscate_command(ctx):
         lang = LANG_MAP.get(ext, 'unknown')
         
         if lang in ['lua', 'luau']:
-            deob_engine = DeobfuscatorEngine()
-            deobfuscated_code, meta = deob_engine.analyze_and_deobfuscate(content)
-            
+            deob_engine = AdvancedDeobfuscatorEngine()
+            deobfuscated_code, meta = deob_engine.transform(content)
+
             deobs_filename = "deobfuscated_" + filename
             deobs_path = "temp_" + deobs_filename
             
