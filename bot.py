@@ -746,6 +746,78 @@ class AdvancedLuaObfuscatorEngine:
 
 
 # ==========================================================
+# OLD OBFUSCATION DETECTOR (for analysis)
+# ==========================================================
+class ObfuscationDetector:
+    def __init__(self, content):
+        self.content = content
+        self.is_obfuscated = False
+        self.obfuscation_techniques = []
+        self.confidence = 0
+
+    def detect(self):
+        score = 0
+        
+        if re.search(r'[A-Za-z0-9+/]{50,}={0,2}', self.content):
+            self.obfuscation_techniques.append('Base64 encoded strings')
+            score += 20
+        
+        if re.search(r'\\x[0-9a-fA-F]{2}', self.content):
+            self.obfuscation_techniques.append('Hex encoded strings')
+            score += 15
+        
+        if re.search(r'\\u[0-9a-fA-F]{4}', self.content):
+            self.obfuscation_techniques.append('Unicode encoded strings')
+            score += 15
+        
+        var_names = re.findall(r'(?:var|let|const|local|function)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)', self.content)
+        if var_names:
+            avg_length = sum(len(v) for v in var_names) / len(var_names)
+            if avg_length < 3:
+                self.obfuscation_techniques.append('Extremely short variable names')
+                score += 25
+        
+        if re.search(r'(?:eval|exec|Function|loadstring|_G)', self.content):
+            self.obfuscation_techniques.append('Dynamic code execution')
+            score += 20
+        
+        if re.search(r'string\.char|String\.fromCharCode|chr\(', self.content):
+            self.obfuscation_techniques.append('Character code obfuscation')
+            score += 15
+        
+        if re.search(r'(?:\+\+|--)[\s]*[a-zA-Z_$]+', self.content):
+            self.obfuscation_techniques.append('Increment/decrement obfuscation')
+            score += 10
+        
+        if re.search(r'!\[\]\+\[\]', self.content) or re.search(r'\[\]\[\'\w+\'\]', self.content):
+            self.obfuscation_techniques.append('JavaScript bracket notation obfuscation')
+            score += 25
+        
+        if re.search(r'function\s*\([a-z]\)\s*\{[^\}]*\}', self.content):
+            self.obfuscation_techniques.append('Single-letter parameter functions')
+            score += 10
+        
+        if re.search(r'(?:0x[0-9a-fA-F]+)', self.content):
+            hex_count = len(re.findall(r'0x[0-9a-fA-F]+', self.content))
+            if hex_count > 10:
+                self.obfuscation_techniques.append('Hexadecimal number obfuscation')
+                score += 15
+        
+        if re.search(r'(?:split|join|concat)\s*\(', self.content):
+            self.obfuscation_techniques.append('String manipulation obfuscation')
+            score += 10
+        
+        if re.search(r'(?:self|_ENV|_G)\[.*?\]', self.content):
+            self.obfuscation_techniques.append('Global table access obfuscation')
+            score += 15
+        
+        self.confidence = min(score, 100)
+        self.is_obfuscated = score >= 30
+        
+        return self.is_obfuscated, self.obfuscation_techniques, self.confidence
+
+
+# ==========================================================
 # ADVANCED OBFUSCATION DETECTION / SAFE DEOBF ANALYSIS
 # ==========================================================
 
@@ -1048,76 +1120,6 @@ class DeobfuscatorEngine:
         result = best_adapter.deobfuscate(source)
         return result, best_meta
 
-# ==========================================================
-# OLD OBFUSCATION DETECTOR (for analysis)
-# ==========================================================
-class ObfuscationDetector:
-    def __init__(self, content):
-        self.content = content
-        self.is_obfuscated = False
-        self.obfuscation_techniques = []
-        self.confidence = 0
-
-    def detect(self):
-        score = 0
-        
-        if re.search(r'[A-Za-z0-9+/]{50,}={0,2}', self.content):
-            self.obfuscation_techniques.append('Base64 encoded strings')
-            score += 20
-        
-        if re.search(r'\\x[0-9a-fA-F]{2}', self.content):
-            self.obfuscation_techniques.append('Hex encoded strings')
-            score += 15
-        
-        if re.search(r'\\u[0-9a-fA-F]{4}', self.content):
-            self.obfuscation_techniques.append('Unicode encoded strings')
-            score += 15
-        
-        var_names = re.findall(r'(?:var|let|const|local|function)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)', self.content)
-        if var_names:
-            avg_length = sum(len(v) for v in var_names) / len(var_names)
-            if avg_length < 3:
-                self.obfuscation_techniques.append('Extremely short variable names')
-                score += 25
-        
-        if re.search(r'(?:eval|exec|Function|loadstring|_G)', self.content):
-            self.obfuscation_techniques.append('Dynamic code execution')
-            score += 20
-        
-        if re.search(r'string\.char|String\.fromCharCode|chr\(', self.content):
-            self.obfuscation_techniques.append('Character code obfuscation')
-            score += 15
-        
-        if re.search(r'(?:\+\+|--)[\s]*[a-zA-Z_$]+', self.content):
-            self.obfuscation_techniques.append('Increment/decrement obfuscation')
-            score += 10
-        
-        if re.search(r'!\[\]\+\[\]', self.content) or re.search(r'\[\]\[\'\w+\'\]', self.content):
-            self.obfuscation_techniques.append('JavaScript bracket notation obfuscation')
-            score += 25
-        
-        if re.search(r'function\s*\([a-z]\)\s*\{[^\}]*\}', self.content):
-            self.obfuscation_techniques.append('Single-letter parameter functions')
-            score += 10
-        
-        if re.search(r'(?:0x[0-9a-fA-F]+)', self.content):
-            hex_count = len(re.findall(r'0x[0-9a-fA-F]+', self.content))
-            if hex_count > 10:
-                self.obfuscation_techniques.append('Hexadecimal number obfuscation')
-                score += 15
-        
-        if re.search(r'(?:split|join|concat)\s*\(', self.content):
-            self.obfuscation_techniques.append('String manipulation obfuscation')
-            score += 10
-        
-        if re.search(r'(?:self|_ENV|_G)\[.*?\]', self.content):
-            self.obfuscation_techniques.append('Global table access obfuscation')
-            score += 15
-        
-        self.confidence = min(score, 100)
-        self.is_obfuscated = score >= 30
-        
-        return self.is_obfuscated, self.obfuscation_techniques, self.confidence
 
 class SourceAnalyzer:
     def __init__(self, content, ext):
