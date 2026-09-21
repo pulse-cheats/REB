@@ -10,7 +10,9 @@ import aiohttp
 import base64
 import random
 import string
+import json
 from discord.ext import commands
+from discord import app_commands
 from datetime import datetime
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -78,6 +80,197 @@ class DuplicateCommandEvent(commands.CommandError):
 async def prevent_duplicate_dispatch(ctx):
     if not _claim_message(ctx.message.id):
         raise DuplicateCommandEvent()
+
+
+# ==========================================================
+# PRIVATE API CHAT (IN-MEMORY ONLY)
+# ==========================================================
+# API credentials are intentionally kept only in memory and are never written
+# to disk, logs, embeds, or generated reports. Each user gets an isolated
+# conversation. This supports OpenAI-compatible chat APIs; arbitrary REST APIs
+# still require an endpoint/schema and are not treated as free-form chat.
+_API_SESSIONS: Dict[int, Dict[str, Any]] = {}
+_API_LOCKS: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_API_LAST_REQUEST: Dict[int, float] = {}
+_API_MAX_HISTORY = 20
+_API_MAX_MESSAGE_CHARS = 8000
+
+def _api_endpoint(base_url: str) -> str:
+    base = base_url.strip().rstrip('/')
+    if base.endswith('/chat/completions'):
+        return base
+    return base + '/chat/completions'
+
+def _trim_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    # Keep the system prompt plus the most recent turns.
+    if not history:
+        return history
+    system = [m for m in history if m.get('role') == 'system'][:1]
+    rest = [m for m in history if m.get('role') != 'system'][-(_API_MAX_HISTORY - len(system)): ]
+    return system + rest
+
+async def _api_chat(user_id: int, prompt: str) -> str:
+    session = _API_SESSIONS.get(user_id)
+    if not session:
+        return 'No API is configured. Use `/api` in this DM first.'
+    prompt = prompt.strip()
+    if not prompt:
+        return 'Send a message after configuring the API.'
+    if len(prompt) > _API_MAX_MESSAGE_CHARS:
+        return f'Message is too long. Maximum: {_API_MAX_MESSAGE_CHARS} characters.'
+
+    now = asyncio.get_running_loop().time()
+    last = _API_LAST_REQUEST.get(user_id, 0.0)
+    if now - last < 1.5:
+        return 'Please wait a moment before sending another API request.'
+    _API_LAST_REQUEST[user_id] = now
+
+    async with _API_LOCKS[user_id]:
+        history = session.setdefault('history', [{'role': 'system', 'content': session.get('system', 'You are a helpful assistant.')}])
+        history.append({'role': 'user', 'content': prompt})
+        session['history'] = _trim_history(history)
+
+        payload = {
+            'model': session['model'],
+            'messages': session['history'],
+            'temperature': session.get('temperature', 0.7),
+        }
+        headers = {
+            'Authorization': 'Bearer ' + session['key'],
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=90)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.post(_api_endpoint(session['base_url']), json=payload, headers=headers) as resp:
+                    raw = await resp.text()
+                    if resp.status >= 400:
+                        # Never echo the key or Authorization header.
+                        return f'API error {resp.status}: {raw[:1200]}'
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        return 'API returned a non-JSON response.'
+
+            answer = ''
+            choices = data.get('choices') or []
+            if choices:
+                message = choices[0].get('message') or {}
+                answer = message.get('content') or ''
+            if not answer:
+                answer = data.get('output_text') or data.get('response') or ''
+            if not isinstance(answer, str) or not answer.strip():
+                return 'The API returned no text content.'
+
+            session['history'].append({'role': 'assistant', 'content': answer})
+            session['history'] = _trim_history(session['history'])
+            return answer
+        except asyncio.TimeoutError:
+            return 'API request timed out.'
+        except aiohttp.ClientError as exc:
+            return 'API connection error: ' + str(exc)[:500]
+        except Exception as exc:
+            print('API CHAT ERROR:', repr(exc))
+            return 'Unexpected API error: ' + str(exc)[:500]
+
+async def _wait_dm(interaction: discord.Interaction, prompt: str, *, secret=False) -> Optional[discord.Message]:
+    await interaction.followup.send(prompt)
+    channel_id = interaction.channel_id
+    user_id = interaction.user.id
+    def check(m: discord.Message) -> bool:
+        return m.author.id == user_id and m.channel.id == channel_id
+    try:
+        return await bot.wait_for('message', check=check, timeout=180)
+    except asyncio.TimeoutError:
+        await interaction.followup.send('Setup timed out. Run `/api` again.')
+        return None
+
+@bot.tree.command(name='api', description='Configure a private OpenAI-compatible API chat in DMs')
+async def api_command(interaction: discord.Interaction):
+    if interaction.guild is not None:
+        await interaction.response.send_message('🔒 Use `/api` in a DM with me.', ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    user_id = interaction.user.id
+    await interaction.followup.send(
+        '**Private API setup**\n'
+        'This setup stays in this DM. I will keep the API key **in memory only** and will not write it to disk or logs.\n\n'
+        'First, send the API base URL (for example `https://api.openai.com/v1`).'
+    )
+    base_msg = await _wait_dm(interaction, 'Send the API base URL now (or `default` for OpenAI).')
+    if not base_msg:
+        return
+    base = base_msg.content.strip()
+    if base.lower() == 'default':
+        base = 'https://api.openai.com/v1'
+    if not re.match(r'^https://[^\s]+$', base, re.IGNORECASE):
+        await interaction.followup.send('❌ Use an HTTPS API base URL.')
+        return
+
+    key_msg = await _wait_dm(interaction, 'Now send the API key. I will delete that message immediately if Discord allows it.')
+    if not key_msg:
+        return
+    key = key_msg.content.strip()
+    try:
+        await key_msg.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    if len(key) < 10 or len(key) > 1000:
+        await interaction.followup.send('❌ That does not look like a valid API key.')
+        return
+
+    model_msg = await _wait_dm(interaction, 'Finally send the model name, e.g. `gpt-5`.')
+    if not model_msg:
+        return
+    model = model_msg.content.strip()[:200]
+    if not model:
+        await interaction.followup.send('❌ Model cannot be empty.')
+        return
+
+    _API_SESSIONS[user_id] = {
+        'base_url': base,
+        'key': key,
+        'model': model,
+        'history': [{'role': 'system', 'content': 'You are a helpful, concise assistant. Be accurate and ask for clarification when needed.'}],
+    }
+    await interaction.followup.send(
+        f'✅ API connected.\n**Endpoint:** `{base}`\n**Model:** `{model}`\n\n'
+        'You can now message me normally in this DM and I will send your messages to the configured API.\n'
+        'Use `/api-clear` to forget the API key and conversation from this bot.'
+    )
+
+@bot.tree.command(name='api-clear', description='Forget your configured API key and private API conversation')
+async def api_clear_command(interaction: discord.Interaction):
+    _API_SESSIONS.pop(interaction.user.id, None)
+    _API_LAST_REQUEST.pop(interaction.user.id, None)
+    await interaction.response.send_message('🧹 Your API configuration and conversation have been removed from bot memory.')
+
+@bot.tree.command(name='api-status', description='Show whether your private API chat is configured')
+async def api_status_command(interaction: discord.Interaction):
+    session = _API_SESSIONS.get(interaction.user.id)
+    if not session:
+        await interaction.response.send_message('❌ No API configured. Use `/api` in this DM.')
+        return
+    await interaction.response.send_message(f'✅ Connected to `{session["base_url"]}` using model `{session["model"]}`. The key is kept in memory only.')
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    # In DMs, configured users can chat directly without a prefix.
+    if message.guild is None and message.author.id in _API_SESSIONS and not message.content.startswith('/'):
+        async with message.channel.typing():
+            answer = await _api_chat(message.author.id, message.content)
+        # Discord message limit is 2000 chars.
+        if len(answer) <= 2000:
+            await message.channel.send(answer)
+        else:
+            for i in range(0, len(answer), 1900):
+                await message.channel.send(answer[i:i+1900])
+        return
+    await bot.process_commands(message)
 
 
 LANG_MAP = {
@@ -759,9 +952,9 @@ class AdvancedLuaRenamer:
 
 
 class AdvancedLuaObfuscatorEngine:
-    def __init__(self, source_code: str, seed: int = 1337):
+    def __init__(self, source_code: str, seed: Optional[int] = None):
         self.original_source = source_code
-        self.seed = seed
+        self.seed = seed if seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
         self.validation_errors: List[str] = []
 
     def _tree_sitter_valid(self, source: str) -> bool:
@@ -1976,13 +2169,23 @@ def generate_implementation(analysis_text, target_lang, detected_features, secur
 
     return "\n".join(lines)
 
+_TREE_SYNCED = False
+
 @bot.event
 async def on_ready():
+    global _TREE_SYNCED
     print("BOT IS ONLINE")
     print("Bot Name:", bot.user.name)
     print("Bot ID:", bot.user.id)
     print("Servers:", len(bot.guilds))
     print("Intents configured")
+    if not _TREE_SYNCED:
+        try:
+            await bot.tree.sync()
+            _TREE_SYNCED = True
+            print("Slash commands synced")
+        except Exception as exc:
+            print("SLASH SYNC ERROR:", repr(exc))
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -2035,6 +2238,16 @@ async def help_command(ctx):
         inline=False
     )
     
+    embed.add_field(
+        name="/api",
+        value="Configure a private OpenAI-compatible API in DMs. The API key is kept in memory only. Use /api-clear to remove it.",
+        inline=False
+    )
+    embed.add_field(
+        name=".cleanup [1-500]",
+        value="Deletes recent messages sent by this bot in the current channel. Requires Manage Messages.",
+        inline=False
+    )
     embed.add_field(
         name=".ping",
         value="Checks if the bot is online and responsive.",
@@ -2420,6 +2633,54 @@ async def generate_bypass(ctx):
         print("BYPASS ERROR:", e)
         print(traceback.format_exc())
         await ctx.send("Error: " + str(e))
+
+
+@bot.tree.command(name='cleanup', description='Delete recent messages sent by this bot in the current channel')
+@app_commands.describe(limit='Maximum number of recent messages to scan (1-500)')
+async def cleanup_slash(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 500] = 100):
+    if interaction.guild is None:
+        await interaction.response.send_message('❌ This command is for server channels.')
+        return
+    perms = interaction.user.guild_permissions
+    if not perms.manage_messages:
+        await interaction.response.send_message('❌ You need Manage Messages to use this command.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    deleted = 0
+    async for msg in interaction.channel.history(limit=int(limit) + 1):
+        if msg.author.id == bot.user.id:
+            try:
+                await msg.delete()
+                deleted += 1
+            except discord.HTTPException:
+                pass
+    await interaction.followup.send(f'🧹 Deleted {deleted} recent bot messages.', ephemeral=True)
+
+@bot.command(name='cleanup')
+@commands.has_permissions(manage_messages=True)
+async def cleanup_command(ctx, limit: int = 100):
+    """Delete recent bot messages in the current channel. Use a bounded limit."""
+    limit = max(1, min(limit, 500))
+    deleted = 0
+    async for msg in ctx.channel.history(limit=limit + 1):
+        if msg.author.id == bot.user.id:
+            try:
+                await msg.delete()
+                deleted += 1
+            except discord.HTTPException:
+                pass
+    # Avoid creating another message after cleanup.
+    print(f'CLEANUP: deleted {deleted} bot messages in channel {ctx.channel.id}')
+
+@cleanup_command.error
+async def cleanup_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send('❌ You need Manage Messages to use `.cleanup`.')
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send('Usage: `.cleanup [1-500]`')
+    else:
+        print('CLEANUP ERROR:', repr(error))
+
 
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
